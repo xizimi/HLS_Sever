@@ -93,6 +93,7 @@ void HeapTimer::doWork(int id) {
     }
     size_t i = ref_[id];
     auto node = heap_[i];
+    cout<<"timeer closse conn id="<<id<<endl;
     node.cb();  // 触发回调函数
     del_(i);
 }

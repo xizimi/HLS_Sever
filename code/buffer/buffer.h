@@ -4,9 +4,12 @@
 #include <iostream>
 #include <unistd.h>  // write
 #include <sys/uio.h> //readv
+#include <sys/socket.h> //recv
 #include <vector> //readv
 #include <atomic>
 #include <assert.h>
+// #include "../log/log.h"
+#include "../tool/Hex.h"
 class Buffer {
 public:
     Buffer(int initBuffSize = 1024);
@@ -35,7 +38,9 @@ public:
     void Append(const Buffer& buff);
 
     ssize_t ReadFd(int fd, int* Errno);
+    ssize_t ReadFd_my(int fd, int* Errno);
     ssize_t WriteFd(int fd, int* Errno);
+    ssize_t all_sent=0;
 
 private:
     char* BeginPtr_();  // buffer开头

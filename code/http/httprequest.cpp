@@ -1,6 +1,53 @@
 #include "httprequest.h"
 using namespace std;
 
+
+
+
+std::string HttpRequest::SafePath(const std::string& s) {
+    for (char c : s) {
+        if (!(c == '/' || c == '.' || c == '_' || c == '-' ||
+              (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+            throw std::invalid_argument("Unsafe character in path");
+        }
+    }
+    return s;
+}
+
+void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
+    std::thread([this,input = std::move(input), outputDir = std::move(outputDir)]() {
+        try {
+            std::string safeIn = SafePath(input);
+            std::string safeOut = SafePath(outputDir);
+
+            if (access(safeIn.c_str(), F_OK) != 0) {
+                std::cerr << "[HLS] File not found: " << safeIn << "\n";
+                return;
+            }
+
+            std::system(("mkdir -p " + safeOut).c_str());
+
+            std::string cmd =
+                "ffmpeg -y -i \"" + safeIn + "\" "
+                "-c:v libx264 -profile:v baseline -level 3.0 "
+                "-c:a aac -ar 44100 "
+                "-hls_time 4 -hls_list_size 0 "
+                "-hls_segment_filename \"" + safeOut + "/index%03d.ts\" "   
+                "-hls_base_url \"" + safeOut + "/\" "                       
+                "-f hls \"" + safeOut + "/index.m3u8\" "
+                "2>/dev/null";
+
+            std::cout << "[HLS] Running...\n";
+            int ret = std::system(cmd.c_str());
+            std::cout << "[HLS] " << (ret ? " Failed" : " Success") << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[HLS] Error: " << e.what() << "\n";
+        }
+    }).detach();
+}
+
+
+
 // 网页名称，和一般的前端跳转不同，这里需要将请求信息放到后端来验证一遍再上传（和小组成员还起过争执）
 const unordered_set<string> HttpRequest::DEFAULT_HTML {
     "/index", "/register", "/login", "/welcome", "/video", "/picture",
@@ -17,6 +64,8 @@ void HttpRequest::Init() {
     method_ = path_ = version_= body_ = "";
     header_.clear();
     post_.clear();
+    content_length_ = 0;
+    body_.clear();
 }
 
 // 解析处理
@@ -60,6 +109,192 @@ bool HttpRequest::parse(Buffer& buff) {
     return true;
 }
 
+
+bool HttpRequest::my_parse(Buffer& buff) {
+
+        const char CRLF[] = "\r\n";
+        
+        while (buff.ReadableBytes() > 0 && state_ != FINISH) {
+            // ==================== REQUEST_LINE & HEADERS ====================
+            if (state_ == REQUEST_LINE || state_ == HEADERS) {
+                // 查找换行
+                const char* line_end = std::search(
+                    buff.Peek(), buff.BeginWriteConst(),
+                    CRLF, CRLF + 2
+                );
+                
+                if (line_end == buff.BeginWriteConst()) {
+                    break; // 数据不足
+                }
+                
+                std::string line(buff.Peek(), line_end);
+                buff.RetrieveUntil(line_end + 2);
+                
+                if (state_ == REQUEST_LINE) {
+                    if (!ParseRequestLine_(line)) return true;
+                    if (method_ == "GET") {
+                    state_ = FINISH;
+                    return false;
+                }
+                } else if (state_ == HEADERS) {
+                    if (line.empty()) { // Headers结束
+                        if (!header_.count("content-length")) {
+                            state_ = FINISH;
+                            return true;
+                        }
+                        content_length_ = std::stoul(header_["content-length"]);
+                        
+                        // 解析boundary
+                        if (parseMultipartBoundary()) {
+                            state_ = BODY_START;
+                        } else {
+                            state_ = FINISH; // 不是multipart，直接结束
+                        }
+                    } else {
+                        ParseHeader_(line);
+                    }
+                }
+            }
+            // ==================== BODY_START: 处理boundary ====================
+            else if (state_ == BODY_START) {
+                // 读取第一行应该是boundary
+                const char* line_end = std::search(
+                    buff.Peek(), buff.BeginWriteConst(),
+                    CRLF, CRLF + 2
+                );
+                if (line_end == buff.BeginWriteConst()) break;
+                
+                std::string line(buff.Peek(), line_end);
+                buff.RetrieveUntil(line_end + 2);
+                
+                if (line == boundary_marker_) {
+                    state_ = BODY_DATA;
+                } else {
+                    return true; // 格式错误
+                }
+            }
+            // ==================== BODY_DATA: 处理文件头或数据 ====================
+            else if (state_ == BODY_DATA) {
+                const char* line_end = std::search(
+                    buff.Peek(), buff.BeginWriteConst(),
+                    CRLF, CRLF + 2
+                );
+                
+                if (!in_file_part_) {
+                    // 解析Content-Disposition和Content-Type
+                    if (line_end == buff.BeginWriteConst()) break;
+                    
+                    std::string line(buff.Peek(), line_end);
+                    buff.RetrieveUntil(line_end + 2);
+                    
+                    if (line.find("Content-Disposition") == 0) {
+                        is_file_part_ = extractFilenameFromDisposition(line); // 记录是否是文件
+                    }
+                    // 继续读 headers，直到空行
+                    if (line.empty()) {
+                        // Headers 结束
+                        if (is_file_part_) {
+                            in_file_part_ = true;
+                            openVideoFile();
+                        }
+                    }
+                    
+                } else{
+    // ==================== 流式写入：保守策略（不丢数据） ====================
+                const char* data = buff.Peek();
+                const char* end = buff.BeginWriteConst();
+
+                // 先尝试找 closing boundary（带 --）
+                const char* closing_pos = std::search(data, end, 
+                    boundary_end_.c_str(), boundary_end_.c_str() + boundary_end_.size());
+
+                if (closing_pos != end) {
+                    // 检查前面是否有 \r\n
+                    if (closing_pos >= data + 2 && 
+                        closing_pos[-2] == '\r' && closing_pos[-1] == '\n') {
+                        // 文件数据截止于 \r\n 之前
+                        size_t file_data_len = (closing_pos - 2) - data;
+                        if (file_data_len > 0) {
+                            video_file_.write(data, file_data_len);
+                            body_received_ += file_data_len;
+                        }
+                        // 消费到 closing boundary 结束
+                        buff.RetrieveUntil(closing_pos + boundary_end_.size());
+                        state_ = FINISH;
+                        in_file_part_ = false;
+                        video_file_.close();
+                        continue; // 继续循环，处理剩余数据（如有）
+                    }
+                }
+
+                // 如果没找到 closing boundary，就写入全部（避免丢数据）
+                size_t readable = buff.ReadableBytes();
+                if (readable > 0) {
+                    video_file_.write(data, readable);
+                    body_received_ += readable;
+                    buff.Retrieve(readable);
+                }
+            }
+                        }
+            // ==================== BODY_END: 处理结束 ====================
+            else if (state_ == BODY_END) {
+                // 消费掉boundary和后面的--以及\r\n
+                const char* line_end = std::search(
+                    buff.Peek(), buff.BeginWriteConst(),
+                    CRLF, CRLF + 2
+                );
+                if (line_end == buff.BeginWriteConst()) break;
+                
+                buff.RetrieveUntil(line_end + 2);
+                state_ = FINISH;
+                video_file_.close(); // 关闭文件
+            }
+        }
+        if(state_ == FINISH&&!download_in_progress_) {
+        
+            std::string video_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
+        
+            std::string input_path = "./sever_videodata/" + filename_;
+    
+            std::string output_dir = "./muts_ts/" + video_id + "_out"; 
+
+            convertToHLSAsync(input_path, output_dir);
+            download_in_progress_ = true;
+            MYSQL* sql = nullptr;
+        {
+            SqlConnRAII raii(&sql, SqlConnPool::Instance()); // 自动获取+归还连接
+            if (sql) {
+                // 安全转义字符串（防 SQL 注入）
+                auto escape = [sql](const std::string& s) -> std::string {
+                    if (s.empty()) return "";
+                    std::string res;
+                    res.resize(s.size() * 2 + 1); // 转义后最长为 2n+1
+                    unsigned long len = mysql_real_escape_string(sql, &res[0], s.c_str(), s.size());
+                    res.resize(len);
+                    return res;
+                };
+
+                std::string escaped_id = escape(video_id);
+                std::string escaped_name = escape(filename_);
+                std::string hls_path = output_dir + "/index.m3u8";
+                std::string insert_sql =
+                        "INSERT INTO videos (id, original_name, hls_path, status, created_at) VALUES ('"
+                        + escaped_id + "', '"
+                        + escaped_name + "', '"
+                        + escape(hls_path) + "', '"
+                        + "ready" + "', "
+                        + "NOW()" + ")";   
+                if (mysql_query(sql, insert_sql.c_str())) {
+                    std::cerr << "[DB ERROR] Insert failed: " << mysql_error(sql) << std::endl;
+                } else {
+                    std::cout << "[INFO] Video record inserted: " << video_id << std::endl;
+                }
+            }
+        }
+        }
+        
+        return true;
+    }
 bool HttpRequest::ParseRequestLine_(const string& line) {
     regex patten("^([^ ]*) ([^ ]*) HTTP/([^ ]*)$");
     smatch Match;   // 用来匹配patten得到结果
@@ -69,6 +304,7 @@ bool HttpRequest::ParseRequestLine_(const string& line) {
         path_ = Match[2];
         version_ = Match[3];
         state_ = HEADERS;
+        // cout<<method_.c_str()<<endl;
         return true;
     }
     LOG_ERROR("RequestLine Error");
@@ -86,24 +322,85 @@ void HttpRequest::ParsePath_() {
     }
 }
 
-void HttpRequest::ParseHeader_(const string& line) {
-    regex patten("^([^:]*): ?(.*)$");
-    smatch Match;
-    if(regex_match(line, Match, patten)) {
-        header_[Match[1]] = Match[2];
-    } else {    // 匹配失败说明首部行匹配完了，状态变化
-        state_ = BODY;
+// void HttpRequest::ParseHeader_(const string& line) {
+//     regex patten("^([^:]*): ?(.*)$");
+//     smatch Match;
+//     if(regex_match(line, Match, patten)) {
+//         header_[Match[1]] = Match[2];
+//     } else {    // 匹配失败说明首部行匹配完了，状态变化
+//         state_ = BODY;
+//     }
+// }
+void HttpRequest::openVideoFile() {
+        if (!filename_.empty() && !file_opened_) {
+            string all_pa="./sever_videodata/" + filename_;
+            video_file_.open(all_pa, std::ios::binary);
+            if (video_file_.is_open()) {
+                file_opened_ = true;
+                std::cout << "Started saving to: " <<all_pa << std::endl;
+            } else {
+                std::cerr << "Failed to create file: " << all_pa << std::endl;
+            }
+        }
     }
+void HttpRequest::ParseHeader_(const std::string& line) {
+    size_t pos = line.find(':');
+    if (pos != std::string::npos) {
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 2);
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        header_[key] = value;
+    }
+    // for(auto &kv : header_) {
+    //     cout<<kv.first.c_str()<<", "<<kv.second.c_str()<<endl;
+    // }
+
 }
 
-void HttpRequest::ParseBody_(const string& line) {
+void HttpRequest::ParseBody_(const std::string& line) {
     body_ = line;
     ParsePost_();
     state_ = FINISH;    // 状态转换为下一个状态
     LOG_DEBUG("Body:%s, len:%d", line.c_str(), line.size());
 }
 
-
+bool HttpRequest::extractFilenameFromDisposition(const std::string& line) {
+    // 示例: Content-Disposition: form-data; name="video"; filename="1.mp4"
+    size_t pos = line.find("filename=");
+    if (pos == std::string::npos) return false;
+    
+    filename_ = line.substr(pos + 9); // 9 = len("filename=")
+    
+    // 去除引号
+    if (!filename_.empty() && filename_[0] == '"') {
+        size_t end_quote = filename_.find_last_of('"');
+        if (end_quote != std::string::npos) {
+            filename_ = filename_.substr(1, end_quote - 1);
+        }
+    }
+    
+    // 安全清理：防止路径穿越攻击
+    return !filename_.empty();
+}
+    
+bool HttpRequest::parseMultipartBoundary() {
+        auto it = header_.find("content-type");
+        if (it == header_.end()) return false;
+        
+        const std::string& ct = it->second;
+        size_t pos = ct.find("boundary=");
+        if (pos == std::string::npos) return false;
+        
+        boundary_ = ct.substr(pos + 9);
+        // 去除引号（如果有）
+        if (!boundary_.empty() && boundary_[0] == '"') {
+            boundary_ = boundary_.substr(1, boundary_.length() - 2);
+        }
+        
+        boundary_marker_ = "--" + boundary_;
+        boundary_end_ = "--" + boundary_ + "--";
+        return true;
+    }
 // 16进制转化为10进制
 int HttpRequest::ConverHex(char ch) {
     if(ch >= 'A' && ch <= 'F') 
@@ -175,6 +472,42 @@ void HttpRequest::ParseFromUrlencoded_() {
     }
 }
 
+std::string HttpRequest::getHlsPathById(std::string& video_id) {
+    std::string hls_path;
+    if (video_id.find("ts") != std::string::npos)
+    {
+        return video_id; 
+    }
+
+    MYSQL* sql = nullptr;
+    {
+        SqlConnRAII raii(&sql, SqlConnPool::Instance());
+        if (sql) {
+                            auto escape = [sql](const std::string& s) -> std::string {
+                    if (s.empty()) return "";
+                    std::string res;
+                    res.resize(s.size() * 2 + 1); // 转义后最长为 2n+1
+                    unsigned long len = mysql_real_escape_string(sql, &res[0], s.c_str(), s.size());
+                    res.resize(len);
+                    return res;
+                };
+            // 安全转义
+            std::string escaped_id = escape(video_id); // 你需要实现 escapeString
+            std::string query = "SELECT hls_path FROM videos WHERE id = '" + escaped_id + "' AND status = 'ready'";
+            
+            if (mysql_query(sql, query.c_str()) == 0) {
+                MYSQL_RES* res = mysql_store_result(sql);
+                if (res && mysql_num_rows(res) > 0) {
+                    MYSQL_ROW row = mysql_fetch_row(res);
+                    if (row[0]) hls_path = row[0];
+                }
+                mysql_free_result(res);
+            }
+        }
+    }
+    
+    return hls_path; // 若未找到，返回空字符串
+}
 bool HttpRequest::UserVerify(const string &name, const string &pwd, bool isLogin) {
     if(name == "" || pwd == "") { return false; }
     LOG_INFO("Verify name:%s pwd:%s", name.c_str(), pwd.c_str());
@@ -243,6 +576,20 @@ std::string HttpRequest::path() const{
 std::string& HttpRequest::path(){
     return path_;
 }
+std::string& HttpRequest::re_path(){
+    size_t pos = path_.find("?id=");
+    if(pos == std::string::npos)
+        return path_;
+
+    size_t start = pos + 4;
+    size_t end   = path_.find('/', start);
+    path_ = (end == std::string::npos)
+            ? path_.substr(start)
+            : path_.substr(start, end - start);
+    // cout<<"path"<<path_.c_str()<<endl;
+    return path_; 
+}
+
 std::string HttpRequest::method() const {
     return method_;
 }
@@ -272,4 +619,34 @@ bool HttpRequest::IsKeepAlive() const {
         return header_.find("Connection")->second == "keep-alive" && version_ == "1.1";
     }
     return false;
+}
+void updateVideoStatus(const std::string& video_id, bool success, const std::string& hls_url) {
+    MYSQL* sql = nullptr;
+    {
+        SqlConnRAII raii(&sql, SqlConnPool::Instance());
+        if (!sql) return;
+
+        auto escape = [sql](const std::string& s) -> std::string {
+            if (s.empty()) return "";
+            std::string res;
+            res.resize(s.size() * 2 + 1);
+            unsigned long len = mysql_real_escape_string(sql, &res[0], s.c_str(), s.size());
+            res.resize(len);
+            return res;
+        };
+
+        std::string escaped_id = escape(video_id);
+        if (success) {
+            std::string escaped_url = escape(hls_url);
+            std::string sql_str = 
+                "UPDATE videos SET hls_path = '" + escaped_url + "', status = 'ready' WHERE id = '" + escaped_id + "'";
+            mysql_query(sql, sql_str.c_str());
+            std::cout << "[INFO] Video ready: " << video_id << " -> " << hls_url << std::endl;
+        } else {
+            std::string sql_str = 
+                "UPDATE videos SET status = 'failed' WHERE id = '" + escaped_id + "'";
+            mysql_query(sql, sql_str.c_str());
+            std::cerr << "[ERROR] Video failed: " << video_id << std::endl;
+        }
+    }
 }

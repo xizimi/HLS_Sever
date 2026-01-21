@@ -8,6 +8,7 @@
 #include <errno.h>      
 
 #include "../log/log.h"
+#include "../tool/Hex.h"
 #include "../buffer/buffer.h"
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -28,6 +29,7 @@ public:
     const char* GetIP() const;
     sockaddr_in GetAddr() const;
     bool process();
+    bool my_process(int len);
 
     // 写的总长度
     int ToWriteBytes() { 
@@ -57,6 +59,7 @@ private:
 
     HttpRequest request_;
     HttpResponse response_;
+    std::string os_path_="";
 };
 
 

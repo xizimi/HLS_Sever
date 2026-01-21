@@ -6,7 +6,7 @@
 #include <unistd.h>      // close
 #include <sys/stat.h>    // stat
 #include <sys/mman.h>    // mmap, munmap
-
+#include   <fstream>
 #include "../buffer/buffer.h"
 #include "../log/log.h"
 
@@ -22,6 +22,7 @@ public:
     size_t FileLen() const;
     void ErrorContent(Buffer& buff, std::string message);
     int Code() const { return code_; }
+    void MakeResponse_my(Buffer& buff,std::string data_path);
 
 private:
     void AddStateLine_(Buffer &buff);

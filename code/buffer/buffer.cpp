@@ -112,6 +112,19 @@ ssize_t Buffer::ReadFd(int fd, int* Errno) {
     }
     return len;
 }
+ssize_t Buffer::ReadFd_my(int fd, int* Errno) {
+    ssize_t len = recv(fd, BeginWrite(), WritableBytes(),0);
+    std::cout<<"recv len="<<len<<std::endl;
+    all_sent+=len;
+    std::cout<<"all_sent="<<all_sent<<std::endl;
+     if(len < 0) {
+        *Errno = errno;
+     }else{
+        writePos_ += len; 
+     }
+    // LOG_BASE(0, HexDump(Peek(), 1024).c_str());
+    return len;
+}
 
 // 将buffer中可读的区域写入fd中
 ssize_t Buffer::WriteFd(int fd, int* Errno) {

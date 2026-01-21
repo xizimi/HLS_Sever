@@ -76,6 +76,35 @@ void HttpResponse::MakeResponse(Buffer& buff) {
     AddHeader_(buff);
     AddContent_(buff);
 }
+void HttpResponse::MakeResponse_my(Buffer& buff,string data_path) 
+{
+    if(data_path[0]!='.')
+        data_path="."+data_path;
+    cout<<"make data_path:"<<data_path<<endl;
+    buff.Append("HTTP/1.1 200 OK\r\n");
+    if(data_path.find(".ts") != std::string::npos)
+    {
+        buff.Append("Content-Type: video/MP2T\r\n");
+    }else{
+        buff.Append("Content-Type: application/vnd.apple.mpegurl\r\n");
+    }
+    buff.Append("Cache-Control: no-cache\r\n");
+    buff.Append("Connection: close\r\n");
+    struct stat st{};
+    if (stat(data_path.c_str(), &st) == 0)
+        buff.Append("Content-Length: " + std::to_string(st.st_size) + "\r\n");
+    buff.Append("\r\n");  
+    std::ifstream file(data_path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return;
+    }
+    size_t sz = file.tellg();
+    file.seekg(0);
+
+    std::string body(sz, '\0');
+    file.read(&body[0], sz);   
+    buff.Append(body);            
+}
 
 char* HttpResponse::File() {
     return mmFile_;
