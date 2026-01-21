@@ -14,8 +14,54 @@ std::string HttpRequest::SafePath(const std::string& s) {
     return s;
 }
 
+// void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
+//     std::thread([this,input = std::move(input), outputDir = std::move(outputDir)]() {
+//         try {
+//             std::string safeIn = SafePath(input);
+//             std::string safeOut = SafePath(outputDir);
+
+//             if (access(safeIn.c_str(), F_OK) != 0) {
+//                 std::cerr << "[HLS] File not found: " << safeIn << "\n";
+//                 return;
+//             }
+
+//             std::system(("mkdir -p " + safeOut).c_str());
+
+//             std::string cmd =
+//                 "ffmpeg -y -i \"" + safeIn + "\" "
+//                 "-c:v libx264 -profile:v baseline -level 3.0 "
+//                 "-c:a aac -ar 44100 "
+//                 "-hls_time 4 -hls_list_size 0 "
+//                 "-hls_segment_filename \"" + safeOut + "/index%03d.ts\" "   
+//                 "-hls_base_url \"" + safeOut + "/\" "                       
+//                 "-f hls \"" + safeOut + "/index.m3u8\" "
+//                 "2>/dev/null";
+
+//             std::cout << "[HLS] Running...\n";
+//             int ret = std::system(cmd.c_str());
+//             std::cout << "[HLS] " << (ret ? " Failed" : " Success") << "\n";
+//         } catch (const std::exception& e) {
+//             std::cerr << "[HLS] Error: " << e.what() << "\n";
+//         }
+//     }).detach();
+// 假设你在类外或头文件中定义了 kVariants（使用 width/height）
+//}
+struct Variant {
+    std::string name;
+    int width;
+    int height;
+    std::string bitrate;
+    std::string audio_bitrate;
+};
+
+static const std::vector<Variant> kVariants = {
+    {"360p", 640, 360, "800k", "96k"},
+    {"720p", 1280, 720, "2000k", "128k"},
+    {"1080p", 1920, 1080, "5000k", "192k"}
+};
+
 void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
-    std::thread([this,input = std::move(input), outputDir = std::move(outputDir)]() {
+    std::thread([this, input = std::move(input), outputDir = std::move(outputDir)]() {
         try {
             std::string safeIn = SafePath(input);
             std::string safeOut = SafePath(outputDir);
@@ -25,27 +71,86 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                 return;
             }
 
+            // 创建输出目录
             std::system(("mkdir -p " + safeOut).c_str());
 
-            std::string cmd =
-                "ffmpeg -y -i \"" + safeIn + "\" "
-                "-c:v libx264 -profile:v baseline -level 3.0 "
-                "-c:a aac -ar 44100 "
-                "-hls_time 4 -hls_list_size 0 "
-                "-hls_segment_filename \"" + safeOut + "/index%03d.ts\" "   
-                "-hls_base_url \"" + safeOut + "/\" "                       
-                "-f hls \"" + safeOut + "/index.m3u8\" "
-                "2>/dev/null";
+            std::vector<std::string> variantPaths;
 
-            std::cout << "[HLS] Running...\n";
-            int ret = std::system(cmd.c_str());
-            std::cout << "[HLS] " << (ret ? " Failed" : " Success") << "\n";
+            // 1. 为每个码率生成 HLS 子流
+            for (const auto& var : kVariants) {
+                std::string varDir = safeOut + "/" + var.name;
+                std::system(("mkdir -p \"" + varDir + "\"").c_str()); // 加引号防路径含空格
+
+                std::string segPattern = varDir + "/index%03d.ts";
+                std::string playlist = varDir + "/index.m3u8";
+
+                // ✅ 正确构建滤镜：使用 width/height 分开
+                std::string vf = "scale=" + std::to_string(var.width) + ":" + std::to_string(var.height)
+                               + ":force_original_aspect_ratio=decrease,"
+                               + "pad=" + std::to_string(var.width) + ":" + std::to_string(var.height)
+                               + ":(ow-iw)/2:(oh-ih)/2";
+
+                // 构建 FFmpeg 命令
+                std::string cmd =
+                    "ffmpeg -y -i \"" + safeIn + "\" "
+                    "-vf \"" + vf + "\" "
+                    "-c:v libx264 -profile:v baseline -level 3.1 "
+                    "-b:v " + var.bitrate + " -maxrate " + var.bitrate + " -bufsize " + var.bitrate + " "
+                    "-c:a aac -b:a " + var.audio_bitrate + " -ar 44100 "
+                    "-hls_time 4 -hls_list_size 0 "
+                    "-hls_segment_filename \"" + segPattern + "\" "
+                    "-f hls \"" + playlist + "\" "
+                    "2>/dev/null";
+
+                std::cout << "[HLS] Encoding " << var.name << "...\n";
+                // std::cout << "[CMD] " << cmd << "\n"; // 调试用，上线可删
+
+                int ret = std::system(cmd.c_str());
+                if (ret != 0) {
+                    std::cerr << "[HLS] Failed to encode " << var.name << ", see " << varDir << "/ffmpeg.log\n";
+                    continue;
+                }
+                variantPaths.push_back(var.name + "/index.m3u8");
+            }
+
+            // 2. 生成 Master Playlist
+            if (!variantPaths.empty()) {
+                std::string masterPath = safeOut + "/master.m3u8";
+                std::ofstream master(masterPath);
+                if (master.is_open()) {
+                    master << "#EXTM3U\n";
+                    master << "#EXT-X-VERSION:3\n\n";
+
+                    for (size_t i = 0; i < variantPaths.size(); ++i) {
+                        const auto& var = kVariants[i];
+                        // 计算总码率 (bps)
+                        auto parseBitrate = [](const std::string& br) -> int {
+                            std::string s = br;
+                            if (s.back() == 'k' || s.back() == 'K') {
+                                return std::stoi(s.substr(0, s.size()-1)) * 1000;
+                            }
+                            return std::stoi(s);
+                        };
+                        int totalBps = parseBitrate(var.bitrate) + parseBitrate(var.audio_bitrate);
+
+                        // ✅ RESOLUTION 必须是 WxH 字符串
+                        std::string resolution = std::to_string(var.width) + "x" + std::to_string(var.height);
+
+                        master << "#EXT-X-STREAM-INF:BANDWIDTH=" << totalBps
+                               << ",RESOLUTION=" << resolution << "\n";
+                        master << variantPaths[i] << "\n\n";
+                    }
+                    master.close();
+                    std::cout << "[HLS] Master playlist generated: " << masterPath << "\n";
+                }
+            }
+
+            std::cout << "[HLS] Conversion completed.\n";
         } catch (const std::exception& e) {
-            std::cerr << "[HLS] Error: " << e.what() << "\n";
+            std::cerr << "[HLS] Exception: " << e.what() << "\n";
         }
     }).detach();
 }
-
 
 
 // 网页名称，和一般的前端跳转不同，这里需要将请求信息放到后端来验证一遍再上传（和小组成员还起过争执）
@@ -276,7 +381,7 @@ bool HttpRequest::my_parse(Buffer& buff) {
 
                 std::string escaped_id = escape(video_id);
                 std::string escaped_name = escape(filename_);
-                std::string hls_path = output_dir + "/index.m3u8";
+                std::string hls_path = output_dir + "/master.m3u8";
                 std::string insert_sql =
                         "INSERT INTO videos (id, original_name, hls_path, status, created_at) VALUES ('"
                         + escaped_id + "', '"
@@ -474,10 +579,10 @@ void HttpRequest::ParseFromUrlencoded_() {
 
 std::string HttpRequest::getHlsPathById(std::string& video_id) {
     std::string hls_path;
-    if (video_id.find("ts") != std::string::npos)
-    {
-        return video_id; 
-    }
+    // if (video_id.find("ts") != std::string::npos)
+    // {
+    //     return video_id; 
+    // }
 
     MYSQL* sql = nullptr;
     {
@@ -505,6 +610,9 @@ std::string HttpRequest::getHlsPathById(std::string& video_id) {
             }
         }
     }
+    size_t last_slash = hls_path.find_last_of('/');
+    std::string dir_path = hls_path.substr(0, last_slash);
+    hls_path=dir_path+os_path_;
     
     return hls_path; // 若未找到，返回空字符串
 }
@@ -577,12 +685,13 @@ std::string& HttpRequest::path(){
     return path_;
 }
 std::string& HttpRequest::re_path(){
-    size_t pos = path_.find("?id=");
+    size_t pos = path_.find("vid_");
     if(pos == std::string::npos)
         return path_;
 
-    size_t start = pos + 4;
+    size_t start = pos;
     size_t end   = path_.find('/', start);
+    os_path_=path_.substr(end,path_.size()-end);
     path_ = (end == std::string::npos)
             ? path_.substr(start)
             : path_.substr(start, end - start);
