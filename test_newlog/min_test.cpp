@@ -178,7 +178,7 @@ int main() {
 
     
     std::cout << "Enter local video file path: ";
-    std::string video_path="../video_data/2.mp4";
+    std::string video_path="../video_data/1.mp4";
     
     // 提取文件名
     size_t last_slash = video_path.find_last_of("/\\");
