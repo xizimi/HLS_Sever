@@ -295,7 +295,7 @@ int main(int argc, char* argv[]) {
 
     std::string server_ip = "192.168.46.10";
     int server_port = 1316;
-    std::string video_id = "vid_1769062118_9383";
+    std::string video_id = "vid_1769065051_9383";
     std::string output_dir = "./video_data/hls_downloads"; // 按你的设定
 
     // 如果你想启用命令行参数，取消下面的注释

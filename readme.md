@@ -1,16 +1,19 @@
-# A C++轻量级、高性能、高并发的Web服务器
+# C++ 轻量级高性能 HLS 点播服务器
 ## Introduction
-用C++实现的高性能WEB服务器，经过webbenchh压力测试可以实现上万的QPS
+用C++实现的高性能HLS点播服务器，
 
 ## Function
 * 利用IO复用技术Epoll与线程池实现多线程的Reactor高并发模型；
-* 利用正则与状态机解析HTTP请求报文，实现处理静态资源的请求；
+* 利用正则与状态机解析请求客户端POST/GET报文；
+* 接收数据使用LT模式每接收一部分数据就存入文件降低内存占用；
+* 通过将视频文件分成多个chunk分片发送接收并根据complete请求将云端视频块合并并转码为HLS格式(.ts+.m3u8)实现断点续传；
+* 多个分辨率版本m3u8文件可供客户端根据传输速度自由选择；
+* 用mysql数据库存储请求视频id与实际存储目录，真实文件路径对客户端不可见，实现安全存储；
 * 利用标准库容器封装char，实现自动增长的缓冲区；
 * 基于小根堆实现的定时器，关闭超时的非活动连接；
 * 利用单例模式与阻塞队列实现异步的日志系统，记录服务器运行状态；
-* 利用RAII机制实现了数据库连接池，减少数据库连接建立与关闭的开销，同时实现了用户注册登录功能。
+* 利用RAII机制实现了数据库连接池，减少数据库连接建立与关闭的开销。
 
-* 增加logsys,threadpool测试单元(todo: timer, sqlconnpool, httprequest, httpresponse) 
 
 ## Environment
 * Ubuntu 18
@@ -19,37 +22,6 @@
 * Vscode
 * git
 
-## 目录树
-```
-.
-├── code           源代码
-│   ├── buffer
-│   ├── config
-│   ├── http
-│   ├── log
-│   ├── timer
-│   ├── pool
-│   ├── server
-│   └── main.cpp
-├── test           单元测试
-│   ├── Makefile
-│   └── test.cpp
-├── resources      静态资源
-│   ├── index.html
-│   ├── image
-│   ├── video
-│   ├── js
-│   └── css
-├── bin            可执行文件
-│   └── server
-├── log            日志文件
-├── webbench-1.5   压力测试
-├── build          
-│   └── Makefile
-├── Makefile
-├── LICENSE
-└── readme.md
-```
 ## Build & Usage
 ```
 make
@@ -63,39 +35,28 @@ create database yourdb;
 // 创建user表
 USE yourdb;
 CREATE TABLE user(
-    username char(50) NULL,
-    password char(50) NULL
+    id  varchar(32)  NULL,
+    original_name varchar(255) NULL,
+    hls_path text  NULL,
+    status enum('uploading','processing','ready','failed') uploading,
+    created_at timestamp current_timestamp()
 )ENGINE=InnoDB;
 
-// 添加数据
-INSERT INTO user(username, password) VALUES('name', 'password');
-```
 
 ## Test
 ```bash
-日志、线程池测试：
-cd test
-make
+POST、GET测试：
+cd test_newlog
+make min_test -o test
 ./test
+make get_test -o get_test
+./get_test
 
 
-服务器压力测试：
-cd webbench-1.5
-make
-webbench -c 1000 -t 30 http://ip:port/
-webbench -c 1000 -t 30 http://192.168.46.10:1316/
-
-参数：
-	-c 表示客户端数
-	-t 表示时间
-```
-
-![](./imgs/pressure.png)
 
 
-## Thanks
-Linux高性能服务器编程，游双著. 
 
-[@qinguoyi](https://github.com/qinguoyi/TinyWebServer)
+## Thanks 
 
-[@markparticle](https://github.com/markparticle/WebServer)
+[@JehanRio7](https://github.com/JehanRio/TinyWebServer)
+

@@ -86,12 +86,6 @@ void WebServer::Start() {
             if(fd == listenFd_) {
                 DealListen_();
             }
-            // else if(events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-            //     assert(users_.count(fd) > 0);
-            //     DealRead_(&users_[fd]);
-            //     cout<<"while xunhuan close conn"<<endl;
-            //     CloseConn_(&users_[fd]);
-            // }
             else if(events & EPOLLIN) {
                 assert(users_.count(fd) > 0);
                 DealRead_(&users_[fd]);
@@ -125,7 +119,6 @@ void WebServer::SendError_(int fd, const char*info) {
 void WebServer::CloseConn_(HttpConn* client) {
     assert(client);
     LOG_INFO("Client[%d] quit!", client->GetFd());
-    // cout<<"quit"<<endl;
     epoller_->DelFd(client->GetFd());
     client->Close();
 }
@@ -181,28 +174,15 @@ void WebServer::OnRead_(HttpConn* client) {
     int ret = -1;
     int readErrno = 0;
     ret = client->read(&readErrno);         // 读取客户端套接字的数据，读到httpconn的读缓存区
-    // if(ret <= 0 && readErrno != EAGAIN) {   // 读异常就关闭客户端
-    //     CloseConn_(client);
-    //     cout<<"close conn"<<endl;
-    //     return;
-    // }
-    // 业务逻辑的处理（先读后处理）
     OnProcess(client,ret);
-    // epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLIN);
-
 }
 
 /* 处理读（请求）数据的函数 */
 void WebServer::OnProcess(HttpConn* client,int len) {
     // 首先调用process()进行逻辑处理
-    // if(client->process()) { // 根据返回的信息重新将fd置为EPOLLOUT（写）或EPOLLIN（读）
-    if(client->my_process(len)) {
-    //读完事件就跟内核说可以写了
-        //epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLOUT);   
+    if(client->my_process(len)) {   
         epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLIN); // 响应成功，修改监听事件为写,等待OnWrite_()发送
     } else {
-    // //写完事件就跟内核说可以读了
-        // cout<<"mod fd epollout"<<endl;
         epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLOUT);
     }
     if(len==0)

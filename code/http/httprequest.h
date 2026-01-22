@@ -10,6 +10,7 @@
 #include <fstream> 
 #include "../buffer/buffer.h"
 #include "../log/log.h"
+#include "../log/log.h"
 #include "../pool/sqlconnpool.h"
 
 class HttpRequest {

@@ -81,6 +81,7 @@ void HttpResponse::MakeResponse_my(Buffer& buff,string data_path)
     if(data_path[0]!='.')
         data_path="."+data_path;
     // cout<<"make data_path:"<<data_path<<endl;
+    LOG_INFO("Issue documents:%s", data_path.c_str());
     buff.Append("HTTP/1.1 200 OK\r\n");
     if(data_path.find(".ts") != std::string::npos)
     {

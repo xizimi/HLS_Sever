@@ -14,38 +14,6 @@ std::string HttpRequest::SafePath(const std::string& s) {
     return s;
 }
 
-// void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
-//     std::thread([this,input = std::move(input), outputDir = std::move(outputDir)]() {
-//         try {
-//             std::string safeIn = SafePath(input);
-//             std::string safeOut = SafePath(outputDir);
-
-//             if (access(safeIn.c_str(), F_OK) != 0) {
-//                 std::cerr << "[HLS] File not found: " << safeIn << "\n";
-//                 return;
-//             }
-
-//             std::system(("mkdir -p " + safeOut).c_str());
-
-//             std::string cmd =
-//                 "ffmpeg -y -i \"" + safeIn + "\" "
-//                 "-c:v libx264 -profile:v baseline -level 3.0 "
-//                 "-c:a aac -ar 44100 "
-//                 "-hls_time 4 -hls_list_size 0 "
-//                 "-hls_segment_filename \"" + safeOut + "/index%03d.ts\" "   
-//                 "-hls_base_url \"" + safeOut + "/\" "                       
-//                 "-f hls \"" + safeOut + "/index.m3u8\" "
-//                 "2>/dev/null";
-
-//             std::cout << "[HLS] Running...\n";
-//             int ret = std::system(cmd.c_str());
-//             std::cout << "[HLS] " << (ret ? " Failed" : " Success") << "\n";
-//         } catch (const std::exception& e) {
-//             std::cerr << "[HLS] Error: " << e.what() << "\n";
-//         }
-//     }).detach();
-// 假设你在类外或头文件中定义了 kVariants（使用 width/height）
-//}
 struct Variant {
     std::string name;
     int width;
@@ -100,8 +68,7 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                     "-f hls \"" + playlist + "\" "
                     "2>/dev/null";
 
-                std::cout << "[HLS] Encoding " << var.name << "...\n";
-                // std::cout << "[CMD] " << cmd << "\n"; // 调试用，上线可删
+                LOG_INFO("[HLS] Encoding %s", var.name.c_str());
 
                 int ret = std::system(cmd.c_str());
                 if (ret != 0) {
@@ -111,7 +78,6 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                 variantPaths.push_back(var.name + "/index.m3u8");
             }
 
-            // 2. 生成 Master Playlist
             if (!variantPaths.empty()) {
                 std::string masterPath = safeOut + "/master.m3u8";
                 std::ofstream master(masterPath);
@@ -138,11 +104,11 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                         master << variantPaths[i] << "\n\n";
                     }
                     master.close();
-                    std::cout << "[HLS] Master playlist generated: " << masterPath << "\n";
+                    
                 }
             }
 
-            std::cout << "[HLS] Conversion completed.\n";
+            LOG_INFO("[HLS] Conversion completed.");
         } catch (const std::exception& e) {
             std::cerr << "[HLS] Exception: " << e.what() << "\n";
         }
@@ -213,20 +179,18 @@ bool HttpRequest::parse(Buffer& buff) {
 
 
 bool HttpRequest::my_parse(Buffer& buff) {
-        // cout<<"my_parse called"<<endl;
         const char CRLF[] = "\r\n";
         
         while (buff.ReadableBytes() > 0 && state_ != FINISH) {
             // ==================== REQUEST_LINE & HEADERS ====================
             if (state_ == REQUEST_LINE || state_ == HEADERS) {
-                // 查找换行
                 const char* line_end = std::search(
                     buff.Peek(), buff.BeginWriteConst(),
                     CRLF, CRLF + 2
                 );
                 
                 if (line_end == buff.BeginWriteConst()) {
-                    break; // 数据不足
+                    break; 
                 }
                 
                 std::string line(buff.Peek(), line_end);
@@ -265,7 +229,6 @@ bool HttpRequest::my_parse(Buffer& buff) {
             }
             // ==================== BODY_START: 处理boundary ====================
             else if (state_ == BODY_START) {
-                // 读取第一行应该是boundary
                 const char* line_end = std::search(
                     buff.Peek(), buff.BeginWriteConst(),
                     CRLF, CRLF + 2
@@ -335,7 +298,6 @@ bool HttpRequest::my_parse(Buffer& buff) {
                     }
                 }
 
-                // 如果没找到 closing boundary，就写入全部（避免丢数据）
                 size_t readable = buff.ReadableBytes();
                 if (readable > 0) {
                     video_file_.write(data, readable);
@@ -390,21 +352,19 @@ bool HttpRequest::my_parse(Buffer& buff) {
             total_chunks = extractIntField(buff.Peek(), "total_chunks");
             std::string chunk_dir = "./sever_videodata/" + upload_id;
             std::string output_path = "./sever_videodata/" + filename;
-            // cout<<chunk_dir<<"chunk dir"<<endl;
-            // cout<<"outpath"<<output_path<<endl;
-
+            LOG_INFO("Combining chunks for upload_id: %s, filename: %s, total_chunks: %d", 
+                     upload_id.c_str(), filename.c_str(), total_chunks);
             std::ofstream out_file(output_path, std::ios::binary);
             for (int i = 0; i < total_chunks; ++i) {
                 std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(i);
                 std::ifstream chunk_file(chunk_path, std::ios::binary);
                 out_file << chunk_file.rdbuf();
+                std::remove(chunk_path.c_str());
                 chunk_file.close();
             }
             out_file.close();
 
             std::string video_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
-        
-            // std::string input_path = "./sever_videodata/" + filename_;
     
             std::string output_dir = "./muts_ts/" + video_id + "_out"; 
 
@@ -473,15 +433,6 @@ void HttpRequest::ParsePath_() {
     }
 }
 
-// void HttpRequest::ParseHeader_(const string& line) {
-//     regex patten("^([^:]*): ?(.*)$");
-//     smatch Match;
-//     if(regex_match(line, Match, patten)) {
-//         header_[Match[1]] = Match[2];
-//     } else {    // 匹配失败说明首部行匹配完了，状态变化
-//         state_ = BODY;
-//     }
-// }
 void HttpRequest::openVideoFile() {
         if (!filename_.empty() && !file_opened_) {
             size_t pos=filename_.find_last_of("/");
@@ -492,10 +443,11 @@ void HttpRequest::openVideoFile() {
             }
             mkdir(dir.c_str(), 0755); // 创建目录，忽略错误
             string all_pa="./sever_videodata/" + filename_;
+            LOG_INFO("Opening file for writing: %s", all_pa.c_str());
             video_file_.open(all_pa, std::ios::binary);
             if (video_file_.is_open()) {
                 file_opened_ = true;
-                std::cout << "Started saving to: " <<all_pa << std::endl;
+                // std::cout << "Started saving to: " <<all_pa << std::endl;
             } else {
                 std::cerr << "Failed to create file: " << all_pa << std::endl;
             }
@@ -508,11 +460,7 @@ void HttpRequest::ParseHeader_(const std::string& line) {
         std::string value = line.substr(pos + 2);
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         header_[key] = value;
-        // cout<<"Header Key: "<<key.c_str()<<", Value: "<<value.c_str()<<endl;
     }
-    // for(auto &kv : header_) {
-    //     cout<<kv.first.c_str()<<", "<<kv.second.c_str()<<endl;
-    // }
 
 }
 
@@ -633,10 +581,6 @@ void HttpRequest::ParseFromUrlencoded_() {
 
 std::string HttpRequest::getHlsPathById(std::string& video_id) {
     std::string hls_path;
-    // if (video_id.find("ts") != std::string::npos)
-    // {
-    //     return video_id; 
-    // }
 
     MYSQL* sql = nullptr;
     {
