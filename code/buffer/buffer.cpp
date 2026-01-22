@@ -114,9 +114,9 @@ ssize_t Buffer::ReadFd(int fd, int* Errno) {
 }
 ssize_t Buffer::ReadFd_my(int fd, int* Errno) {
     ssize_t len = recv(fd, BeginWrite(), WritableBytes(),0);
-    std::cout<<"recv len="<<len<<std::endl;
+    // std::cout<<"recv len="<<len<<std::endl;
     all_sent+=len;
-    std::cout<<"all_sent="<<all_sent<<std::endl;
+    // std::cout<<"all_sent="<<all_sent<<std::endl;
      if(len < 0) {
         *Errno = errno;
      }else{

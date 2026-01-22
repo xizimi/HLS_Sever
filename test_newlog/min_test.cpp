@@ -6,7 +6,10 @@
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <vector>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 class VideoUploader {
 private:
@@ -168,34 +171,153 @@ public:
     return true;
 }
 };
+std::vector<std::string> splitFileIntoChunks(const std::string& input_path, size_t chunk_size = 5 * 1024 * 1024) {
+    std::ifstream infile(input_path, std::ios::binary);
+    if (!infile.is_open()) {
+        std::cerr << "Cannot open input file: " << input_path << std::endl;
+        return {};
+    }
 
+    infile.seekg(0, std::ios::end);
+    size_t file_size = infile.tellg();
+    infile.seekg(0, std::ios::beg);
+
+    size_t total_chunks = (file_size + chunk_size - 1) / chunk_size;
+    std::vector<std::string> chunk_files;
+
+    std::cout << "Splitting " << input_path << " (" << file_size << " bytes) into " 
+              << total_chunks << " chunks..." << std::endl;
+
+    std::vector<char> buffer(chunk_size);
+    for (size_t i = 0; i < total_chunks; ++i) {
+        size_t bytes_to_read = (i == total_chunks - 1) ? (file_size - i * chunk_size) : chunk_size;
+        infile.read(buffer.data(), bytes_to_read);
+
+        // 生成临时 chunk 文件名
+        std::string chunk_name = "temp_chunk_" + std::to_string(i);
+        std::ofstream outfile(chunk_name, std::ios::binary);
+        if (!outfile.is_open()) {
+            std::cerr << "Cannot create chunk file: " << chunk_name << std::endl;
+            // 清理已创建的 chunks
+            for (const auto& f : chunk_files) std::remove(f.c_str());
+            return {};
+        }
+        outfile.write(buffer.data(), bytes_to_read);
+        outfile.close();
+
+        chunk_files.push_back(chunk_name);
+        std::cout << "Created: " << chunk_name << " (" << bytes_to_read << " bytes)" << std::endl;
+    }
+
+    infile.close();
+    return chunk_files;
+}
+
+// ====== 新增：发送 /complete 请求 ======
+bool sendCompleteRequest(const std::string& server_ip, int server_port,
+                         const std::string& upload_id, const std::string& final_filename,size_t total_chunks) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+
+    struct sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
+        close(sock);
+        return false;
+    }
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        return false;
+    }
+
+    // 构造 JSON body
+    std::string json_body = "{"
+        "\"upload_id\":\"" + upload_id + "\","
+        "\"filename\":\"" + final_filename + "\","
+        "\"total_chunks\":" + std::to_string(total_chunks) +
+    "}";
+
+    std::ostringstream req;
+    req << "POST /upload/complete HTTP/1.1\r\n";
+    req << "Host: " << server_ip << ":" << server_port << "\r\n";
+    req << "Content-Type: application/json\r\n";
+    req << "Content-Length: " << json_body.size() << "\r\n";
+    req << "Connection: close\r\n\r\n";
+    req << json_body;
+
+    std::string request = req.str();
+    send(sock, request.c_str(), request.size(), 0);
+
+    char resp_buf[1024];
+    recv(sock, resp_buf, sizeof(resp_buf), 0); // 简单读响应
+
+    close(sock);
+    return true;
+}
 int main() {
-    std::cout << "=== TinyWebServer Video Upload Client ===" << std::endl;
+       std::cout << "=== Chunked Video Upload Client ===" << std::endl;
     
-    // 默认服务器配置
     std::string server_ip = "192.168.46.10";
-    int server_port = 1316; // 默认端口
+    int server_port = 1316;
+    std::string video_path = "../video_data/test_2.mp4";
 
-    
-    std::cout << "Enter local video file path: ";
-    std::string video_path="../video_data/1.mp4";
-    
-    // 提取文件名
+    // 提取原始文件名
     size_t last_slash = video_path.find_last_of("/\\");
-    std::string filename = (last_slash != std::string::npos) ? 
-                          video_path.substr(last_slash + 1) : video_path;
+    std::string original_filename = (last_slash != std::string::npos) ? 
+                                   video_path.substr(last_slash + 1) : video_path;
 
+    // 生成 upload_id（必须和服务端一致）
+    srand(time(nullptr));
+    std::string upload_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
+
+    std::cout << "Upload ID: " << upload_id << std::endl;
+    std::cout << "Original file: " << original_filename << std::endl;
+
+    // 1. 拆分文件
+    std::vector<std::string> chunks = splitFileIntoChunks(video_path);
+    if (chunks.empty()) {
+        std::cerr << "Failed to split file!" << std::endl;
+        return 1;
+    }
+
+    // 2. 上传每个 chunk（复用你的 uploadVideo）
     VideoUploader uploader(server_ip, server_port);
-    
-    std::cout << "Starting upload process..." << std::endl;
-    std::cout << "Server: " << server_ip << ":" << server_port << std::endl;
-    std::cout << "File: " << video_path << std::endl;
-    std::cout << "Remote filename: " << filename << std::endl;
-    
-    if (uploader.uploadVideo(video_path, filename)) {
-        std::cout << "Upload successful!" << std::endl;
+    bool all_success = true;
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        std::cout << "\n--- Uploading chunk " << i << "/" << (chunks.size()-1) << " ---" << std::endl;
+        
+        // 构造带 upload_id 和 index 的“假文件名”，让服务端能识别
+        // 例如: "vid_12345_6789_chunk_0"
+        std::string fake_filename = upload_id +"/"+ "chunk_" + std::to_string(i);
+
+        if (!uploader.uploadVideo(chunks[i], fake_filename)) {
+            std::cerr << "Failed to upload chunk " << i << std::endl;
+            all_success = false;
+            break;
+        }
+    }
+
+    // 3. 清理临时 chunk 文件
+    for (const auto& chunk : chunks) {
+        std::remove(chunk.c_str());
+    }
+
+    if (!all_success) {
+        std::cout << "Upload failed! Aborting complete." << std::endl;
+        return 1;
+    }
+    std::cout << "\nWaiting for server to finish processing chunks..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    //4. 发送 complete
+    std::cout << "\nSending /complete request..." << std::endl;
+    if (sendCompleteRequest(server_ip, server_port, upload_id, original_filename,chunks.size())) {
+        std::cout << "✅ Complete request sent successfully!" << std::endl;
     } else {
-        std::cout << "Upload failed!" << std::endl;
+        std::cerr << "❌ Failed to send complete request!" << std::endl;
+        return 1;
     }
 
     return 0;

@@ -202,7 +202,7 @@ void WebServer::OnProcess(HttpConn* client,int len) {
         epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLIN); // 响应成功，修改监听事件为写,等待OnWrite_()发送
     } else {
     // //写完事件就跟内核说可以读了
-        cout<<"mod fd epollout"<<endl;
+        // cout<<"mod fd epollout"<<endl;
         epoller_->ModFd(client->GetFd(), connEvent_ | EPOLLOUT);
     }
     if(len==0)

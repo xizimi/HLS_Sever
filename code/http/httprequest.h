@@ -83,6 +83,7 @@ private:
     void convertToHLSAsync(std::string input, std::string outputDir);
     bool download_in_progress_ = false;
     std::string os_path_="";
+    bool comlete_singal=false;
 };
 
 #endif

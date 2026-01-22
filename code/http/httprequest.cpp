@@ -84,13 +84,11 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                 std::string segPattern = varDir + "/index%03d.ts";
                 std::string playlist = varDir + "/index.m3u8";
 
-                // ✅ 正确构建滤镜：使用 width/height 分开
                 std::string vf = "scale=" + std::to_string(var.width) + ":" + std::to_string(var.height)
                                + ":force_original_aspect_ratio=decrease,"
                                + "pad=" + std::to_string(var.width) + ":" + std::to_string(var.height)
                                + ":(ow-iw)/2:(oh-ih)/2";
 
-                // 构建 FFmpeg 命令
                 std::string cmd =
                     "ffmpeg -y -i \"" + safeIn + "\" "
                     "-vf \"" + vf + "\" "
@@ -133,7 +131,6 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                         };
                         int totalBps = parseBitrate(var.bitrate) + parseBitrate(var.audio_bitrate);
 
-                        // ✅ RESOLUTION 必须是 WxH 字符串
                         std::string resolution = std::to_string(var.width) + "x" + std::to_string(var.height);
 
                         master << "#EXT-X-STREAM-INF:BANDWIDTH=" << totalBps
@@ -216,7 +213,7 @@ bool HttpRequest::parse(Buffer& buff) {
 
 
 bool HttpRequest::my_parse(Buffer& buff) {
-
+        // cout<<"my_parse called"<<endl;
         const char CRLF[] = "\r\n";
         
         while (buff.ReadableBytes() > 0 && state_ != FINISH) {
@@ -237,6 +234,12 @@ bool HttpRequest::my_parse(Buffer& buff) {
                 
                 if (state_ == REQUEST_LINE) {
                     if (!ParseRequestLine_(line)) return true;
+                    if(path_=="/upload/complete")
+                    {
+                        comlete_singal=true;
+                        state_= FINISH;
+                        break;
+                    }
                     if (method_ == "GET") {
                     state_ = FINISH;
                     return false;
@@ -355,15 +358,57 @@ bool HttpRequest::my_parse(Buffer& buff) {
                 video_file_.close(); // 关闭文件
             }
         }
-        if(state_ == FINISH&&!download_in_progress_) {
-        
+        if(state_ == FINISH&&!download_in_progress_&&comlete_singal) {
+
+                std::string upload_id, filename;
+            int total_chunks = -1;
+
+            auto extractField = [](const std::string& json, const std::string& key) -> std::string {
+                size_t pos = json.find("\"" + key + "\":");
+                if (pos == std::string::npos) return "";
+                pos = json.find('"', pos + key.size() + 3); // 跳过 ":"
+                if (pos == std::string::npos) return "";
+                size_t start = pos + 1;
+                size_t end = json.find('"', start);
+                if (end == std::string::npos) return "";
+                return json.substr(start, end - start);
+            };
+
+            auto extractIntField = [](const std::string& json, const std::string& key) -> int {
+                size_t pos = json.find("\"" + key + "\":");
+                if (pos == std::string::npos) return -1;
+                size_t start = pos + key.size() + 3; // 跳过 ":"
+                while (start < json.size() && isspace(json[start])) start++;
+                size_t end = start;
+                while (end < json.size() && isdigit(json[end])) end++;
+                if (end == start) return -1;
+                return std::stoi(json.substr(start, end - start));
+            };
+
+            upload_id = extractField(buff.Peek(), "upload_id");
+            filename = extractField(buff.Peek(), "filename");
+            total_chunks = extractIntField(buff.Peek(), "total_chunks");
+            std::string chunk_dir = "./sever_videodata/" + upload_id;
+            std::string output_path = "./sever_videodata/" + filename;
+            // cout<<chunk_dir<<"chunk dir"<<endl;
+            // cout<<"outpath"<<output_path<<endl;
+
+            std::ofstream out_file(output_path, std::ios::binary);
+            for (int i = 0; i < total_chunks; ++i) {
+                std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(i);
+                std::ifstream chunk_file(chunk_path, std::ios::binary);
+                out_file << chunk_file.rdbuf();
+                chunk_file.close();
+            }
+            out_file.close();
+
             std::string video_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
         
-            std::string input_path = "./sever_videodata/" + filename_;
+            // std::string input_path = "./sever_videodata/" + filename_;
     
             std::string output_dir = "./muts_ts/" + video_id + "_out"; 
 
-            convertToHLSAsync(input_path, output_dir);
+            convertToHLSAsync(output_path, output_dir);
             download_in_progress_ = true;
             MYSQL* sql = nullptr;
         {
@@ -401,6 +446,7 @@ bool HttpRequest::my_parse(Buffer& buff) {
         return true;
     }
 bool HttpRequest::ParseRequestLine_(const string& line) {
+    // cout<<"ParseRequestLine_ called"<<endl;
     regex patten("^([^ ]*) ([^ ]*) HTTP/([^ ]*)$");
     smatch Match;   // 用来匹配patten得到结果
     // 在匹配规则中，以括号()的方式来划分组别 一共三个括号 [0]表示整体
@@ -438,6 +484,13 @@ void HttpRequest::ParsePath_() {
 // }
 void HttpRequest::openVideoFile() {
         if (!filename_.empty() && !file_opened_) {
+            size_t pos=filename_.find_last_of("/");
+            string dir;
+            if(pos!=string::npos)
+            {
+                dir="./sever_videodata/"+filename_.substr(0,pos);
+            }
+            mkdir(dir.c_str(), 0755); // 创建目录，忽略错误
             string all_pa="./sever_videodata/" + filename_;
             video_file_.open(all_pa, std::ios::binary);
             if (video_file_.is_open()) {
@@ -455,6 +508,7 @@ void HttpRequest::ParseHeader_(const std::string& line) {
         std::string value = line.substr(pos + 2);
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         header_[key] = value;
+        // cout<<"Header Key: "<<key.c_str()<<", Value: "<<value.c_str()<<endl;
     }
     // for(auto &kv : header_) {
     //     cout<<kv.first.c_str()<<", "<<kv.second.c_str()<<endl;
