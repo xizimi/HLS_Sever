@@ -11,7 +11,7 @@
 #include <sstream>
 #include <cstring>
 
-/* -------------- 工具函数：同之前 ------------ */
+/* ---------------- 工具函数 ---------------- */
 static std::string extractBody(const std::string& resp)
 {
     size_t p = resp.find("\r\n\r\n");
@@ -40,21 +40,22 @@ static std::string resolvePath(const std::string& base,
     return (last == std::string::npos) ? ("/" + rel)
                                        : base.substr(0, last + 1) + rel;
 }
-/* -------------------------------------------------- */
+/* ---------------------------------------- */
 
 struct Metrics {
     std::atomic<uint64_t> ok{0};
     std::atomic<uint64_t> fail{0};
     std::atomic<uint64_t> bytes{0};
-    std::atomic<uint64_t> sum_us{0};   // 首包→收完总耗时
+    std::atomic<uint64_t> sum_us{0};
 };
 
-static uint64_t once(const std::string& ip, int port,
-                     const std::string& path,
-                     uint64_t* out_len = nullptr)
+/* 一次 GET：返回 <body, 总字节, 耗时μs>，失败返回空三元组 */
+static std::tuple<std::string, uint64_t, uint64_t>
+once(const std::string& ip, int port, const std::string& path)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return 0;
+    if (sock < 0) return {"", 0, 0};
+
     struct timeval tv{1, 0};
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -63,9 +64,10 @@ static uint64_t once(const std::string& ip, int port,
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
     addr.sin_addr.s_addr = inet_addr(ip.c_str());
+
     auto t0 = std::chrono::steady_clock::now();
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock); return 0;
+        close(sock); return {"", 0, 0};
     }
 
     std::string req = "GET " + path +
@@ -73,101 +75,54 @@ static uint64_t once(const std::string& ip, int port,
                       std::to_string(port) +
                       "\r\nConnection: close\r\n\r\n";
     if (send(sock, req.data(), req.size(), MSG_NOSIGNAL) < 0) {
-        close(sock); return 0;
+        close(sock); return {"", 0, 0};
     }
 
     char buf[16 * 1024];
-    ssize_t n, total = 0;
-    while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) total += n;
+    ssize_t n;
+    std::string raw;
+    while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) raw.append(buf, n);
     close(sock);
-    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return 0;
-    if (out_len) *out_len = total;
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0).count();
-    return us;
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return {"", 0, 0};
+
+    uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+    return {extractBody(raw), raw.size(), us};
 }
 
-/* 一次完整“播放”：master → 选码率 → 子 playlist → 全部 TS */
+/* 一次完整播放链路：master→子 playlist→TS（全片/首片） */
 static void play_once(const std::string& ip, int port,
                       const std::string& master_path,
                       Metrics* m,
-                      bool only_first_ts)          // true=只压首片
+                      bool only_first_ts)
 {
-    /* 1. master */
-    uint64_t len = 0;
-    uint64_t lat = once(ip, port, master_path, &len);
-    if (lat == 0) { m->fail++; return; }
-    m->ok++; m->bytes += len; m->sum_us += lat;
+    /* ① master playlist */
+    auto [mas_body, mas_len, mas_us] = once(ip, port, master_path);
+    if (mas_body.empty()) { m->fail++; return; }
+    m->ok++; m->bytes += mas_len; m->sum_us += mas_us;
 
-    std::string master_body = extractBody("");
-    /* 实际应该收 body，这里简化：用空 body+parse 得到子列表 */
-    master_body = "";   // 你原来用 response，这里同理
-    /* 为了编译先塞空，下面用真实 response 收 */
-    std::string real_master;
-    char tmp[16 * 1024]; ssize_t n;
-    /* 重新拉一次拿 body（省代码不重构）*/
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return;
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip.c_str());
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock); m->fail++; return;
-    }
-    std::string req = "GET " + master_path +
-                      " HTTP/1.1\r\nHost: " + ip + ":" +
-                      std::to_string(port) +
-                      "\r\nConnection: close\r\n\r\n";
-    send(sock, req.data(), req.size(), MSG_NOSIGNAL);
-    while ((n = recv(sock, tmp, sizeof(tmp), 0)) > 0) real_master.append(tmp, n);
-    close(sock);
-    master_body = extractBody(real_master);
-
-    auto sublists = parseM3U8(master_body, master_path);
+    auto sublists = parseM3U8(mas_body, master_path);
     if (sublists.empty()) return;
 
-    /* 2. 随机选一条码率（模拟用户分布） */
+    /* ② 随机选一条码率子 playlist */
     static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<> dist(0, sublists.size() - 1);
     std::string sub_path = resolvePath(master_path, sublists[dist(rng)]);
 
-    /* 3. 拉子 playlist */
-    len = 0;
-    lat = once(ip, port, sub_path, &len);
-    if (lat == 0) { m->fail++; return; }
-    m->ok++; m->bytes += len; m->sum_us += lat;
-
-    std::string sub_body = extractBody("");
-    /* 同样重新收一次 body */
-    real_master.clear();
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return;
-    addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip.c_str());
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock); m->fail++; return;
-    }
-    req = "GET " + sub_path +
-          " HTTP/1.1\r\nHost: " + ip + ":" + std::to_string(port) +
-          "\r\nConnection: close\r\n\r\n";
-    send(sock, req.data(), req.size(), MSG_NOSIGNAL);
-    while ((n = recv(sock, tmp, sizeof(tmp), 0)) > 0) real_master.append(tmp, n);
-    close(sock);
-    sub_body = extractBody(real_master);
+    /* ③ 子 playlist */
+    auto [sub_body, sub_len, sub_us] = once(ip, port, sub_path);
+    if (sub_body.empty()) { m->fail++; return; }
+    m->ok++; m->bytes += sub_len; m->sum_us += sub_us;
 
     auto ts_list = parseM3U8(sub_body, sub_path);
     if (ts_list.empty()) return;
 
-    /* 4. 拉 TS：全片 or 首片 */
+    /* ④ TS：全片 or 首片 */
     for (size_t i = 0; i < ts_list.size(); ++i) {
         if (only_first_ts && i > 0) break;
-        len = 0;
-        lat = once(ip, port, resolvePath(sub_path, ts_list[i]), &len);
-        if (lat == 0) { m->fail++; continue; }
-        m->ok++; m->bytes += len; m->sum_us += lat;
+        auto [ts_body, ts_len, ts_us] = once(ip, port, resolvePath(sub_path, ts_list[i]));
+        if (ts_body.empty()) { m->fail++; continue; }
+        m->ok++; m->bytes += ts_len; m->sum_us += ts_us;
     }
 }
 
@@ -197,7 +152,7 @@ int main(int argc, char* argv[]) {
     const char* path = argv[3];
     int threads    = std::stoi(argv[4]);
     int seconds    = std::stoi(argv[5]);
-    bool only_first = std::stoi(argv[6]);   // 0 全片  1 首片
+    bool only_first = std::stoi(argv[6]);
 
     Metrics m;
     std::vector<std::thread> pool;
