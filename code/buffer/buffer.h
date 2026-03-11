@@ -12,7 +12,7 @@
 #include "../tool/Hex.h"
 class Buffer {
 public:
-    Buffer(int initBuffSize = 1024);
+    Buffer(int initBuffSize = 65536);
     ~Buffer() = default;
 
     size_t WritableBytes() const;       

@@ -4,12 +4,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
-#include <regex>    // 正则表达式
+#include <regex>
 #include <errno.h>     
-#include <mysql.h>  //mysql
+#include <mysql.h>
 #include <fstream> 
 #include "../buffer/buffer.h"
-#include "../log/log.h"
 #include "../log/log.h"
 #include "../pool/sqlconnpool.h"
 
@@ -22,7 +21,8 @@ public:
         BODY_START,
         BODY_DATA,
         BODY_END,
-        FINISH,        
+        FINISH,
+        ERROR
     };
     
     HttpRequest() { Init(); }
@@ -47,17 +47,26 @@ public:
     std::string getHlsPathById(std::string& video_id);
 
 private:
-    bool ParseRequestLine_(const std::string& line);    // 处理请求行
-    void ParseHeader_(const std::string& line);         // 处理请求头
-    void ParseBody_(const std::string& line);           // 处理请求体
-
-    void ParsePath_();                                  // 处理请求路径
-    void ParsePost_();                                  // 处理Post事件
-    void ParseFromUrlencoded_();                        // 从url种解析编码
-
+    bool ParseRequestLine_(const std::string& line);
+    void ParseHeader_(const std::string& line);
+    void ParseBody_(const std::string& line);
+    void ParsePath_();
+    void ParsePost_();
+    void ParseFromUrlencoded_();
+    static bool UserVerify(const std::string& name, const std::string& pwd, bool isLogin);
+    void convertToHLSAsync(std::string input, std::string outputDir);
     
-
-    static bool UserVerify(const std::string& name, const std::string& pwd, bool isLogin);  // 用户验证
+    // 新增：分片上传相关方法
+    void openChunkFile();
+    bool verifyChunkMD5();
+    void updateRedisBitmap();
+    bool checkUploadComplete(const std::string& file_id, int total_chunks);
+    void clearRedisRecord(const std::string& file_id);
+    static void updateVideoStatus(const std::string& video_id, bool success, const std::string& hls_url);
+    
+    // 新增：秒传相关方法
+    bool checkFileExistsByMD5(const std::string& file_md5);
+    void recordFileMD5(const std::string& file_md5, const std::string& file_id);
 
     PARSE_STATE state_;
     std::string method_, path_, version_, body_;
@@ -66,14 +75,14 @@ private:
 
     static const std::unordered_set<std::string> DEFAULT_HTML;
     static const std::unordered_map<std::string, int> DEFAULT_HTML_TAG;
-    static int ConverHex(char ch);  // 16进制转换为10进制
-    size_t content_length_ = 0;   // 新增
-    // std::string body_="";            // 新增：存储原始 body 字节
-    std::ofstream upload_file_;   //  用于写入上传文件
-    std::string upload_filename_; //  临时文件路径
-    std::string boundary_;        // multipart/form-data 的 boundary
-    std::string boundary_marker_; // 边界标记   
-    std::string boundary_end_;    // 结束边界标记
+    static int ConverHex(char ch);
+    
+    size_t content_length_ = 0;
+    std::ofstream upload_file_;
+    std::string upload_filename_;
+    std::string boundary_;
+    std::string boundary_marker_;
+    std::string boundary_end_;
     bool in_file_part_ = false;
     size_t body_received_ = 0;
     std::ofstream video_file_; 
@@ -81,10 +90,15 @@ private:
     bool file_opened_ = false;
     bool is_file_part_ = false;
     std::string SafePath(const std::string& s);
-    void convertToHLSAsync(std::string input, std::string outputDir);
     bool download_in_progress_ = false;
-    std::string os_path_="";
-    bool comlete_singal=false;
+    std::string os_path_ = "";
+    bool complete_signal_ = false;
+    
+    // 分片上传相关字段
+    std::string file_id_;
+    int chunk_index_ = -1;
+    int total_chunks_ = -1;
+    std::string chunk_md5_;
 };
 
 #endif
