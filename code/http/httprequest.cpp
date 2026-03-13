@@ -44,13 +44,18 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
                 return;
             }
 
-            std::system(("mkdir -p " + safeOut).c_str());
+            if (system(("mkdir -p " + safeOut).c_str()) != 0) {
+                LOG_WARN("[HLS] mkdir failed for: %s", safeOut.c_str());
+            }
 
             std::vector<std::string> variantPaths;
 
             for (const auto& var : kVariants) {
                 std::string varDir = safeOut + "/" + var.name;
-                std::system(("mkdir -p \"" + varDir + "\"").c_str());
+                if (system(("mkdir -p \"" + varDir + "\"").c_str()) != 0) {
+                    LOG_WARN("[HLS] mkdir failed for: %s", varDir.c_str());
+                    continue;
+                }
 
                 std::string segPattern = varDir + "/index%03d.ts";
                 std::string playlist = varDir + "/index.m3u8";
@@ -398,12 +403,81 @@ bool HttpRequest::my_parse(Buffer& buff) {
         std::string video_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
         std::string output_dir = "./muts_ts/" + video_id + "_out"; 
 
-        convertToHLSAsync(output_path, output_dir);
-        download_in_progress_ = true;
+        // ==================== 使用 MySQL 事务保证数据一致性 ====================
+        MYSQL* sql = nullptr;
+        bool transaction_started = false;
+        bool db_success = false;
         
-        // 更新数据库
-        std::string hls_path = output_dir + "/master.m3u8";
-        updateVideoStatus(video_id, true, hls_path);
+        {
+            SqlConnRAII raii(&sql, SqlConnPool::Instance());
+            if (sql) {
+                // 开始事务
+                if (beginTransaction(sql)) {
+                    transaction_started = true;
+                    
+                    try {
+                        // 生成 HLS 路径
+                        std::string hls_path = output_dir + "/master.m3u8";
+                        
+                        // 安全转义字符串（防 SQL 注入）
+                        auto escape = [sql](const std::string& s) -> std::string {
+                            if (s.empty()) return "";
+                            std::string res;
+                            res.resize(s.size() * 2 + 1);
+                            unsigned long len = mysql_real_escape_string(sql, &res[0], s.c_str(), s.size());
+                            res.resize(len);
+                            return res;
+                        };
+                        
+                        std::string escaped_id = escape(video_id);
+                        std::string escaped_name = escape(filename);
+                        std::string escaped_hls = escape(hls_path);
+                        
+                        // 插入视频记录（status='processing'）
+                        std::string insert_sql =
+                            "INSERT INTO videos (id, original_name, hls_path, status, created_at) VALUES ('"
+                            + escaped_id + "', '" + escaped_name + "', '" + escaped_hls + "', 'processing', NOW())";
+                        
+                        if (mysql_query(sql, insert_sql.c_str()) == 0) {
+                            // 提交事务
+                            if (commitTransaction(sql)) {
+                                db_success = true;
+                                LOG_INFO("[Transaction] Video record inserted successfully: %s", video_id.c_str());
+                            } else {
+                                LOG_ERROR("[Transaction] Commit failed, rolling back: %s", video_id.c_str());
+                                rollbackTransaction(sql);
+                            }
+                        } else {
+                            LOG_ERROR("[Transaction] Insert failed: %s", mysql_error(sql));
+                            rollbackTransaction(sql);
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("[Transaction] Exception occurred: %s", e.what());
+                        if (transaction_started) {
+                            rollbackTransaction(sql);
+                        }
+                    }
+                } else {
+                    LOG_ERROR("[Transaction] Failed to start transaction");
+                }
+            } else {
+                LOG_ERROR("Failed to get database connection");
+            }
+        }
+        // ==================== 事务结束 ====================
+        
+        // 只有数据库操作成功后才启动 HLS 转换
+        if (db_success) {
+            convertToHLSAsync(output_path, output_dir);
+            download_in_progress_ = true;
+            
+            // HLS 转换完成后异步更新状态（在 convertToHLSAsync 线程中调用 updateVideoStatus）
+            LOG_INFO("[Transaction] HLS conversion started for: %s", video_id.c_str());
+        } else {
+            LOG_ERROR("[Transaction] Database operation failed, skipping HLS conversion: %s", video_id.c_str());
+            // 清理已合并的文件
+            std::remove(output_path.c_str());
+        }
         
         complete_signal_ = false;
     }
@@ -627,9 +701,7 @@ bool HttpRequest::UserVerify(const string &name, const string &pwd, bool isLogin
     assert(sql);
     
     bool flag = false;
-    unsigned int j = 0;
     char order[256] = { 0 };
-    MYSQL_FIELD *fields = nullptr;
     MYSQL_RES *res = nullptr;
     
     if(!isLogin) { flag = true; }
@@ -642,8 +714,6 @@ bool HttpRequest::UserVerify(const string &name, const string &pwd, bool isLogin
         return false; 
     }
     res = mysql_store_result(sql);
-    j = mysql_num_fields(res);
-    fields = mysql_fetch_fields(res);
 
     while(MYSQL_ROW row = mysql_fetch_row(res)) {
         LOG_DEBUG("MYSQL ROW: %s %s", row[0], row[1]);
@@ -741,7 +811,9 @@ void HttpRequest::openChunkFile() {
     }
     
     std::string chunk_dir = "./sever_videodata/" + file_id_;
-    std::system(("mkdir -p " + chunk_dir).c_str());
+    if (system(("mkdir -p " + chunk_dir).c_str()) != 0) {
+        LOG_WARN("[Chunk] mkdir failed for: %s", chunk_dir.c_str());
+    }
     
     std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(chunk_index_);
     LOG_INFO("Opening chunk file for writing: %s", chunk_path.c_str());
@@ -892,6 +964,13 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
         SqlConnRAII raii(&sql, SqlConnPool::Instance());
         if (!sql) return;
 
+        // ==================== 使用事务更新状态 ====================
+        bool transaction_started = false;
+        
+        if (beginTransaction(sql)) {
+            transaction_started = true;
+        }
+        
         auto escape = [sql](const std::string& s) -> std::string {
             if (s.empty()) return "";
             std::string res;
@@ -906,13 +985,141 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
             std::string escaped_url = escape(hls_url);
             std::string sql_str = 
                 "UPDATE videos SET hls_path = '" + escaped_url + "', status = 'ready' WHERE id = '" + escaped_id + "'";
-            mysql_query(sql, sql_str.c_str());
-            LOG_INFO("Video ready: %s -> %s", video_id.c_str(), hls_url.c_str());
+            if (mysql_query(sql, sql_str.c_str()) == 0) {
+                if (transaction_started) {
+                    commitTransaction(sql);
+                }
+                LOG_INFO("Video ready: %s -> %s", video_id.c_str(), hls_url.c_str());
+            } else {
+                LOG_ERROR("Video update failed: %s", mysql_error(sql));
+                if (transaction_started) {
+                    rollbackTransaction(sql);
+                }
+            }
         } else {
             std::string sql_str = 
                 "UPDATE videos SET status = 'failed' WHERE id = '" + escaped_id + "'";
-            mysql_query(sql, sql_str.c_str());
-            LOG_ERROR("Video failed: %s", video_id.c_str());
+            if (mysql_query(sql, sql_str.c_str()) == 0) {
+                if (transaction_started) {
+                    commitTransaction(sql);
+                }
+                LOG_INFO("Video failed: %s", video_id.c_str());
+            } else {
+                LOG_ERROR("Video status update failed: %s", mysql_error(sql));
+                if (transaction_started) {
+                    rollbackTransaction(sql);
+                }
+            }
         }
+        // ==================== 事务结束 ====================
     }
+}
+
+/* ==================== Range Header 实现（断点续传）==================== */
+
+bool HttpRequest::parseRangeHeader() {
+    // 从 header_ 中查找 Range 字段
+    auto it = header_.find("Range");
+    if (it == header_.end()) {
+        has_range_ = false;
+        return false;
+    }
+    
+    const std::string& range_value = it->second;
+    // 解析格式："bytes=start-end" 或 "bytes=start-"
+    std::regex range_regex(R"(bytes=(\d+)-(\d*))");
+    std::smatch match;
+    
+    if (std::regex_match(range_value, match, range_regex)) {
+        has_range_ = true;
+        range_start_ = std::stoull(match[1].str());
+        
+        if (match[2].matched && !match[2].str().empty()) {
+            range_end_ = std::stoull(match[2].str());
+        } else {
+            range_end_ = 0;  // 0 表示到文件末尾
+        }
+        LOG_INFO("[Range] Parse success: start=%zu, end=%zu", range_start_, range_end_);
+        return true;
+    }
+    
+    has_range_ = false;
+    LOG_WARN("[Range] Parse failed: %s", range_value.c_str());
+    return false;
+}
+
+bool HttpRequest::hasRange() const {
+    return has_range_;
+}
+
+size_t HttpRequest::rangeStart() const {
+    return range_start_;
+}
+
+size_t HttpRequest::rangeEnd() const {
+    return range_end_;
+}
+
+size_t HttpRequest::rangeLength() const {
+    if (has_range_ && range_end_ > 0) {
+        return range_end_ - range_start_ + 1;
+    }
+    return 0;  // 未知长度（到文件末尾）
+}
+
+/* ==================== MySQL 事务实现（元数据一致性保证）==================== */
+
+bool HttpRequest::beginTransaction(MYSQL* conn) {
+    if (!conn) {
+        return false;
+    }
+    
+    // 关闭自动提交
+    if (mysql_autocommit(conn, 0) != 0) {
+        LOG_ERROR("[Transaction] Failed to disable autocommit: %s", mysql_error(conn));
+        return false;
+    }
+    
+    // 开始事务
+    if (mysql_query(conn, "START TRANSACTION") != 0) {
+        LOG_ERROR("[Transaction] Failed to start transaction: %s", mysql_error(conn));
+        mysql_autocommit(conn, 1);  // 恢复自动提交
+        return false;
+    }
+    
+    LOG_INFO("[Transaction] Transaction started");
+    return true;
+}
+
+bool HttpRequest::commitTransaction(MYSQL* conn) {
+    if (!conn) {
+        return false;
+    }
+    
+    if (mysql_query(conn, "COMMIT") != 0) {
+        LOG_ERROR("[Transaction] Failed to commit: %s", mysql_error(conn));
+        rollbackTransaction(conn);  // 提交失败则回滚
+        return false;
+    }
+    
+    // 恢复自动提交
+    mysql_autocommit(conn, 1);
+    LOG_INFO("[Transaction] Transaction committed");
+    return true;
+}
+
+bool HttpRequest::rollbackTransaction(MYSQL* conn) {
+    if (!conn) {
+        return false;
+    }
+    
+    if (mysql_query(conn, "ROLLBACK") != 0) {
+        LOG_ERROR("[Transaction] Failed to rollback: %s", mysql_error(conn));
+        // 即使回滚失败也要恢复状态
+    }
+    
+    // 恢复自动提交
+    mysql_autocommit(conn, 1);
+    LOG_INFO("[Transaction] Transaction rolled back");
+    return true;
 }

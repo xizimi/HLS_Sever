@@ -46,6 +46,18 @@ public:
     std::string& re_path();
     std::string getHlsPathById(std::string& video_id);
 
+    // 新增：Range Header 支持（断点续传）
+    bool parseRangeHeader();
+    bool hasRange() const;
+    size_t rangeStart() const;
+    size_t rangeEnd() const;
+    size_t rangeLength() const;
+
+    // 新增：MySQL 事务支持（元数据一致性保证）- 改为 static
+    static bool beginTransaction(MYSQL* conn);
+    static bool commitTransaction(MYSQL* conn);
+    static bool rollbackTransaction(MYSQL* conn);
+
 private:
     bool ParseRequestLine_(const std::string& line);
     void ParseHeader_(const std::string& line);
@@ -99,6 +111,12 @@ private:
     int chunk_index_ = -1;
     int total_chunks_ = -1;
     std::string chunk_md5_;
+
+    // 新增：Range Header 相关字段（断点续传）
+    bool has_range_ = false;
+    size_t range_start_ = 0;
+    size_t range_end_ = 0;  // 0 表示到文件末尾
+
 };
 
 #endif
