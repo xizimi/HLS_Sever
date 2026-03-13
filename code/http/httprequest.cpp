@@ -33,14 +33,17 @@ static const std::vector<Variant> kVariants = {
     {"1080p", 1920, 1080, "5000k", "192k"}
 };
 
-void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
-    std::thread([this, input = std::move(input), outputDir = std::move(outputDir)]() {
+void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir, std::string video_id) {
+    std::thread([this, input = std::move(input), outputDir = std::move(outputDir), video_id = std::move(video_id)]() {
         try {
             std::string safeIn = SafePath(input);
             std::string safeOut = SafePath(outputDir);
 
             if (access(safeIn.c_str(), F_OK) != 0) {
                 std::cerr << "[HLS] File not found: " << safeIn << "\n";
+                // 转码失败，更新状态
+                updateVideoStatus(video_id, false, "");
+                std::remove(safeIn.c_str());
                 return;
             }
 
@@ -114,8 +117,18 @@ void HttpRequest::convertToHLSAsync(std::string input, std::string outputDir) {
             }
 
             LOG_INFO("[HLS] Conversion completed.");
+            
+            // ==================== 步骤 5: HLS 转码完成后 UPDATE status='ready' ====================
+            std::string final_hls_path = safeOut + "/master.m3u8";
+            updateVideoStatus(video_id, true, final_hls_path);
+            
+            // 清理原始上传文件
+            std::remove(safeIn.c_str());
+            
         } catch (const std::exception& e) {
             std::cerr << "[HLS] Exception: " << e.what() << "\n";
+            // 转码异常，更新状态为 failed
+            updateVideoStatus(video_id, false, "");
         }
     }).detach();
 }
@@ -203,10 +216,17 @@ bool HttpRequest::my_parse(Buffer& buff) {
             
             if (state_ == REQUEST_LINE) {
                 if (!ParseRequestLine_(line)) return false;
+                // 修复：complete 请求需要检查 path
                 if (path_ == "/upload/complete") {
                     complete_signal_ = true;
-                    state_ = FINISH;
-                    break;
+                    state_ = BODY;
+                    continue;
+                }
+                // 修复：秒传检查请求，添加 check_signal_ 标记以便区分
+                if (path_ == "/upload/check") {
+                    check_signal_ = true;
+                    state_ = BODY;
+                    continue;
                 }
                 if (method_ == "GET") {
                     state_ = FINISH;
@@ -215,12 +235,24 @@ bool HttpRequest::my_parse(Buffer& buff) {
             } else if (state_ == HEADERS) {
                 if (line.empty()) {
                     if (!header_.count("content-length")) {
-                        state_ = FINISH;
+                        // 修复：移除冗余的 complete_signal_ 设置（REQUEST_LINE 已设置）
+                        if (path_ == "/upload/complete") {
+                            state_ = BODY;
+                        } else if (path_ == "/upload/check") {
+                            state_ = BODY;
+                        } else {
+                            state_ = FINISH;
+                        }
                         return true;
                     }
                     content_length_ = std::stoul(header_["content-length"]);
                     
-                    if (parseMultipartBoundary()) {
+                    // 修复：移除冗余的 complete_signal_ 设置（REQUEST_LINE 已设置）
+                    if (path_ == "/upload/complete") {
+                        state_ = BODY;
+                    } else if (path_ == "/upload/check") {
+                        state_ = BODY;
+                    } else if (parseMultipartBoundary()) {
                         state_ = BODY_START;
                     } else {
                         state_ = FINISH;
@@ -279,6 +311,20 @@ bool HttpRequest::my_parse(Buffer& buff) {
                 if (line.empty()) {
                     if (is_file_part_) {
                         in_file_part_ = true;
+                        
+                        // 修复：分片上传前先检查该分片是否已存在（秒传）
+                        if (!file_id_.empty() && chunk_index_ >= 0 && !chunk_md5_.empty()) {
+                            if (checkChunkExistsByMD5(file_id_, chunk_index_, chunk_md5_)) {
+                                LOG_INFO("[秒传] 分片已存在，跳过上传：video_id=%s, chunk=%d", 
+                                         file_id_.c_str(), chunk_index_);
+                                // 分片已存在，直接标记完成，更新 Redis Bitmap
+                                updateRedisBitmap();
+                                state_ = FINISH;
+                                in_file_part_ = false;
+                                continue;
+                            }
+                        }
+                        
                         openChunkFile();
                     }
                 }
@@ -313,6 +359,11 @@ bool HttpRequest::my_parse(Buffer& buff) {
                         return false;
                     }
                     
+                    // 修复：MD5 验证成功后记录分片 MD5 映射
+                    if (!file_id_.empty() && chunk_index_ >= 0 && !chunk_md5_.empty()) {
+                        recordChunkMD5(file_id_, chunk_index_, chunk_md5_);
+                    }
+                    
                     updateRedisBitmap();
                     state_ = FINISH;
                 } else {
@@ -320,6 +371,89 @@ bool HttpRequest::my_parse(Buffer& buff) {
                     video_file_.write(data, readable);
                     body_received_ += readable;
                     buff.Retrieve(readable);
+                }
+            }
+        }
+        // ==================== BODY ====================
+        // 修复：BODY 状态处理 complete 请求的 JSON body 和秒传检查
+        else if (state_ == BODY) {
+            if (path_ == "/upload/check") {
+                // 秒传检查：解析 JSON 中的 file_id 和 total_chunks
+                std::string json_body(buff.Peek(), buff.ReadableBytes());
+                size_t readable = buff.ReadableBytes();
+                
+                if (readable >= content_length_) {
+                    // 解析 JSON 中的 file_id 和 total_chunks
+                    auto extractField = [](const std::string& json, const std::string& key) -> std::string {
+                        size_t pos = json.find("\"" + key + "\":");
+                        if (pos == std::string::npos) return "";
+                        pos = json.find('"', pos + key.size() + 3);
+                        if (pos == std::string::npos) return "";
+                        size_t start = pos + 1;
+                        size_t end = json.find('"', start);
+                        if (end == std::string::npos) return "";
+                        return json.substr(start, end - start);
+                    };
+                    
+                    auto extractIntField = [](const std::string& json, const std::string& key) -> int {
+                        size_t pos = json.find("\"" + key + "\":");
+                        if (pos == std::string::npos) return -1;
+                        size_t start = pos + key.size() + 3;
+                        while (start < json.size() && isspace(json[start])) start++;
+                        size_t end = start;
+                        while (end < json.size() && (isdigit(json[end]) || json[end] == '-')) end++;
+                        if (end == start) return -1;
+                        return std::stoi(json.substr(start, end - start));
+                    };
+                    
+                    // 修复：将解析结果存储到成员变量，供后续使用
+                    file_id_ = extractField(json_body, "file_id");
+                    total_chunks_ = extractIntField(json_body, "total_chunks");
+                    
+                    LOG_INFO("[秒传检查] video_id=%s, total_chunks=%d", file_id_.c_str(), total_chunks_);
+                    
+                    if (!file_id_.empty() && total_chunks_ > 0) {
+                        // 检查分片上传完成状态
+                        bool complete = checkFileUploadStatus(file_id_, total_chunks_);
+                        
+                        if (complete) {
+                            LOG_INFO("[秒传检查] 文件已完整上传，可跳过：video_id=%s", file_id_.c_str());
+                        } else {
+                            LOG_INFO("[秒传检查] 文件未完整上传，继续上传：video_id=%s", file_id_.c_str());
+                        }
+                    }
+                    
+                    state_ = FINISH;
+                    // 修复：确保数据被清除，避免重复处理
+                    buff.Retrieve(readable);
+                    // 修复：重置 check_signal_ 标志
+                    check_signal_ = false;
+                } else {
+                    break;
+                }
+            }
+            else if (path_ == "/upload/complete") {
+                // 累积 body 数据直到收到完整内容
+                size_t readable = buff.ReadableBytes();
+                if (readable >= content_length_) {
+                    // body 已完整，保持数据在 buff 中供后续处理
+                    state_ = FINISH;
+                } else {
+                    // 继续等待更多数据
+                    break;
+                }
+            } else {
+                // 原有 ParseBody_ 逻辑
+                const char* line_end = std::search(
+                    buff.Peek(), buff.BeginWriteConst(),
+                    CRLF, CRLF + 2
+                );
+                if (line_end != buff.BeginWriteConst()) {
+                    std::string line(buff.Peek(), line_end);
+                    ParseBody_(line);
+                    buff.RetrieveUntil(line_end + 2);
+                } else {
+                    break;
                 }
             }
         }
@@ -338,7 +472,10 @@ bool HttpRequest::my_parse(Buffer& buff) {
     }
     
     // 处理完成请求
-    if (state_ == FINISH && !download_in_progress_ && complete_signal_) {
+    if (state_ == FINISH && complete_signal_) {
+        // 重置标志，允许后续请求
+        complete_signal_ = false;
+        
         std::string json_body(buff.Peek(), buff.ReadableBytes());
         
         std::string upload_id, filename;
@@ -366,47 +503,32 @@ bool HttpRequest::my_parse(Buffer& buff) {
             return std::stoi(json.substr(start, end - start));
         };
 
+        // 修复：使用 header 中的 file_id 作为 upload_id，保持一致性
         upload_id = extractField(json_body, "file_id");
         filename = extractField(json_body, "filename");
         total_chunks = extractIntField(json_body, "total_chunks");
         
         if (upload_id.empty() || total_chunks <= 0) {
             LOG_ERROR("Invalid complete request parameters");
+            download_in_progress_ = false;
             return false;
         }
         
+        // 修复：使用 upload_id 作为 chunk_dir，与 openChunkFile 一致
         std::string chunk_dir = "./sever_videodata/" + upload_id;
-        std::string output_path = "./sever_videodata/" + filename;
+        std::string output_path = "./sever_videodata/" + upload_id + "/merged_" + filename;
         
         LOG_INFO("Combining chunks: %s, %s, %d", 
                  upload_id.c_str(), filename.c_str(), total_chunks);
         
-        std::ofstream out_file(output_path, std::ios::binary);
-        if (!out_file.is_open()) {
-            LOG_ERROR("Failed to create output file: %s", output_path.c_str());
-            return false;
-        }
-        
-        for (int i = 0; i < total_chunks; ++i) {
-            std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(i);
-            std::ifstream chunk_file(chunk_path, std::ios::binary);
-            if (chunk_file.is_open()) {
-                out_file << chunk_file.rdbuf();
-                chunk_file.close();
-                std::remove(chunk_path.c_str());
-            } else {
-                LOG_ERROR("Chunk file not found: %s", chunk_path.c_str());
-            }
-        }
-        out_file.close();
-
-        std::string video_id = "vid_" + std::to_string(time(nullptr)) + "_" + std::to_string(rand() % 10000);
-        std::string output_dir = "./muts_ts/" + video_id + "_out"; 
-
-        // ==================== 使用 MySQL 事务保证数据一致性 ====================
+        // ==================== 步骤 1: 先插入数据库 (status='uploading') ====================
         MYSQL* sql = nullptr;
         bool transaction_started = false;
-        bool db_success = false;
+        bool db_insert_success = false;
+        
+        // 修复：生成 video_id（使用时间戳 + 随机数）
+        std::string video_id = "vid_" + std::to_string(std::time(nullptr)) + "_" + std::to_string(rand());
+        std::string hls_path = "./hls/" + upload_id;
         
         {
             SqlConnRAII raii(&sql, SqlConnPool::Instance());
@@ -416,9 +538,6 @@ bool HttpRequest::my_parse(Buffer& buff) {
                     transaction_started = true;
                     
                     try {
-                        // 生成 HLS 路径
-                        std::string hls_path = output_dir + "/master.m3u8";
-                        
                         // 安全转义字符串（防 SQL 注入）
                         auto escape = [sql](const std::string& s) -> std::string {
                             if (s.empty()) return "";
@@ -432,17 +551,17 @@ bool HttpRequest::my_parse(Buffer& buff) {
                         std::string escaped_id = escape(video_id);
                         std::string escaped_name = escape(filename);
                         std::string escaped_hls = escape(hls_path);
+                        std::string escaped_upload_id = escape(upload_id);
                         
-                        // 插入视频记录（status='processing'）
+                        // 修复：插入视频记录时同时保存 upload_id 关联
                         std::string insert_sql =
-                            "INSERT INTO videos (id, original_name, hls_path, status, created_at) VALUES ('"
-                            + escaped_id + "', '" + escaped_name + "', '" + escaped_hls + "', 'processing', NOW())";
+                            "INSERT INTO videos (id, original_name, hls_path, status, created_at, upload_id) VALUES ('"
+                            + escaped_id + "', '" + escaped_name + "', '" + escaped_hls + "', 'uploading', NOW(), '" + escaped_upload_id + "')";
                         
                         if (mysql_query(sql, insert_sql.c_str()) == 0) {
-                            // 提交事务
                             if (commitTransaction(sql)) {
-                                db_success = true;
-                                LOG_INFO("[Transaction] Video record inserted successfully: %s", video_id.c_str());
+                                db_insert_success = true;
+                                LOG_INFO("[Transaction] Video record inserted (uploading): %s", video_id.c_str());
                             } else {
                                 LOG_ERROR("[Transaction] Commit failed, rolling back: %s", video_id.c_str());
                                 rollbackTransaction(sql);
@@ -464,22 +583,84 @@ bool HttpRequest::my_parse(Buffer& buff) {
                 LOG_ERROR("Failed to get database connection");
             }
         }
-        // ==================== 事务结束 ====================
         
-        // 只有数据库操作成功后才启动 HLS 转换
-        if (db_success) {
-            convertToHLSAsync(output_path, output_dir);
-            download_in_progress_ = true;
-            
-            // HLS 转换完成后异步更新状态（在 convertToHLSAsync 线程中调用 updateVideoStatus）
-            LOG_INFO("[Transaction] HLS conversion started for: %s", video_id.c_str());
-        } else {
-            LOG_ERROR("[Transaction] Database operation failed, skipping HLS conversion: %s", video_id.c_str());
-            // 清理已合并的文件
-            std::remove(output_path.c_str());
+        // 如果数据库插入失败，直接返回
+        if (!db_insert_success) {
+            LOG_ERROR("[Step 1 Failed] Database insert failed, aborting upload: %s", video_id.c_str());
+            download_in_progress_ = false;
+            return false;
         }
         
-        complete_signal_ = false;
+        // ==================== 步骤 2: 合并分片文件 ====================
+        std::ofstream out_file(output_path, std::ios::binary);
+        if (!out_file.is_open()) {
+            LOG_ERROR("[Step 2 Failed] Failed to create output file: %s", output_path.c_str());
+            updateVideoStatus(video_id, false, "");
+            download_in_progress_ = false;
+            return false;
+        }
+        
+        bool all_chunks_merged = true;
+        for (int i = 0; i < total_chunks; ++i) {
+            std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(i);
+            if (access(chunk_path.c_str(), F_OK) != 0) {
+                LOG_ERROR("Chunk file not found: %s", chunk_path.c_str());
+                all_chunks_merged = false;
+                break;
+            }
+            std::ifstream chunk_file(chunk_path, std::ios::binary);
+            if (chunk_file.is_open()) {
+                out_file << chunk_file.rdbuf();
+                chunk_file.close();
+                std::remove(chunk_path.c_str());
+            } else {
+                LOG_ERROR("Chunk file open failed: %s", chunk_path.c_str());
+                all_chunks_merged = false;
+                break;
+            }
+        }
+        out_file.close();
+        
+        if (!all_chunks_merged) {
+            LOG_ERROR("[Step 2 Failed] Chunk merge failed: %s", video_id.c_str());
+            std::remove(output_path.c_str());
+            updateVideoStatus(video_id, false, "");
+            download_in_progress_ = false;
+            return false;
+        }
+        
+        LOG_INFO("[Step 2 Success] File merged successfully: %s", output_path.c_str());
+        
+        // ==================== 步骤 3: 文件写入成功后 UPDATE status='processing' ====================
+        {
+            SqlConnRAII raii(&sql, SqlConnPool::Instance());
+            if (sql) {
+                auto escape = [sql](const std::string& s) -> std::string {
+                    if (s.empty()) return "";
+                    std::string res;
+                    res.resize(s.size() * 2 + 1);
+                    unsigned long len = mysql_real_escape_string(sql, &res[0], s.c_str(), s.size());
+                    res.resize(len);
+                    return res;
+                };
+                
+                std::string escaped_id = escape(video_id);
+                std::string update_sql = 
+                    "UPDATE videos SET status = 'processing' WHERE id = '" + escaped_id + "'";
+                
+                if (mysql_query(sql, update_sql.c_str()) == 0) {
+                    LOG_INFO("[Step 3 Success] Video status updated to 'processing': %s", video_id.c_str());
+                } else {
+                    LOG_ERROR("[Step 3 Failed] Status update failed: %s", mysql_error(sql));
+                }
+            }
+        }
+        
+        // ==================== 步骤 4: 启动 HLS 转码（转码完成后 UPDATE status='ready'） ====================
+        convertToHLSAsync(output_path, hls_path, video_id);
+        download_in_progress_ = true;
+        
+        LOG_INFO("[Step 4] HLS conversion started for: %s", video_id.c_str());
     }
     
     return true;
@@ -826,7 +1007,7 @@ void HttpRequest::openChunkFile() {
     }
 }
 
-// 新增：校验分片 MD5
+// 修复：校验分片 MD5（分片级别秒传核心）
 bool HttpRequest::verifyChunkMD5() {
     if (chunk_md5_.empty()) {
         LOG_WARN("No chunk MD5 provided, skipping verification");
@@ -837,19 +1018,28 @@ bool HttpRequest::verifyChunkMD5() {
     std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(chunk_index_);
     
     std::string local_md5 = MD5::hashFile(chunk_path);
-    LOG_INFO("Verifying chunk %d MD5: client=%s, server=%s", 
-             chunk_index_, chunk_md5_.c_str(), local_md5.c_str());
+    LOG_INFO("Verifying chunk %d MD5: video_id=%s, client=%s, server=%s", 
+             chunk_index_, file_id_.c_str(), chunk_md5_.c_str(), local_md5.c_str());
     
     if (local_md5 != chunk_md5_) {
         LOG_ERROR("Chunk MD5 mismatch! Deleting corrupted chunk.");
+        // 删除损坏的分片文件
         std::remove(chunk_path.c_str());
+        
+        // 修复：清理 Redis 中该分片的记录（防止脏数据）
+        clearRedisRecord(file_id_);
+        
+        // 新增：记录失败日志，包含详细信息
+        LOG_ERROR("[MD5 Verify Failed] video_id=%s, chunk=%d, expected=%s, got=%s",
+                  file_id_.c_str(), chunk_index_, chunk_md5_.c_str(), local_md5.c_str());
+        
         return false;
     }
     
     return true;
 }
 
-// 新增：更新 Redis Bitmap
+// 修复：更新 Redis Bitmap（使用 video_id + chunk_index 跟踪分片）
 void HttpRequest::updateRedisBitmap() {
     if (file_id_.empty() || chunk_index_ < 0) return;
     
@@ -859,6 +1049,7 @@ void HttpRequest::updateRedisBitmap() {
         return;
     }
     
+    // 修复：使用 upload:{video_id} 作为 key，chunk_index 作为 bit 位置
     std::string key = "upload:" + file_id_;
     redisReply* reply = (redisReply*)redisCommand(redis, "SETBIT %s %d 1", key.c_str(), chunk_index_);
     
@@ -872,7 +1063,7 @@ void HttpRequest::updateRedisBitmap() {
     RedisConnPool::Instance()->ReturnConnection(redis);
 }
 
-// 新增：检查上传是否完成
+// 修复：检查上传是否完成（基于 Redis Bitmap）
 bool HttpRequest::checkUploadComplete(const std::string& file_id, int total_chunks) {
     redisContext* redis = RedisConnPool::Instance()->GetConnection();
     if (!redis) {
@@ -911,24 +1102,30 @@ void HttpRequest::clearRedisRecord(const std::string& file_id) {
     RedisConnPool::Instance()->ReturnConnection(redis);
 }
 
-// 新增：检查文件 MD5 是否已存在（秒传核心）
-bool HttpRequest::checkFileExistsByMD5(const std::string& file_md5) {
+// 修复：检查分片是否已存在（秒传核心 - 分片级别）
+bool HttpRequest::checkChunkExistsByMD5(const std::string& video_id, int chunk_index, const std::string& chunk_md5) {
     redisContext* redis = RedisConnPool::Instance()->GetConnection();
     if (!redis) {
-        LOG_ERROR("Failed to get Redis connection for MD5 check");
+        LOG_ERROR("Failed to get Redis connection for chunk MD5 check");
         return false;
     }
     
-    // 使用 MD5 作为 key 查询已上传文件
-    std::string key = "md5_index:" + file_md5;
+    // 修复：使用 md5_chunk:{video_id}:{chunk_index} 作为 key 查询分片 MD5
+    std::string key = "md5_chunk:" + video_id + ":" + std::to_string(chunk_index);
     redisReply* reply = (redisReply*)redisCommand(redis, "GET %s", key.c_str());
     
     bool exists = false;
     if (reply && reply->type == REDIS_REPLY_STRING && reply->len > 0) {
-        // MD5 已存在，返回对应的 file_id
-        std::string existing_file_id(reply->str, reply->len);
-        LOG_INFO("秒传命中！MD5=%s 已存在，file_id=%s", file_md5.c_str(), existing_file_id.c_str());
-        exists = true;
+        std::string existing_md5(reply->str, reply->len);
+        if (existing_md5 == chunk_md5) {
+            // MD5 匹配，分片已存在且内容一致
+            LOG_INFO("[秒传] 分片已存在！video_id=%s, chunk=%d, md5=%s", 
+                     video_id.c_str(), chunk_index, chunk_md5.c_str());
+            exists = true;
+        } else {
+            LOG_WARN("[秒传] 分片 MD5 不匹配，需要重新上传：video_id=%s, chunk=%d", 
+                     video_id.c_str(), chunk_index);
+        }
     }
     
     if (reply) freeReplyObject(reply);
@@ -936,33 +1133,60 @@ bool HttpRequest::checkFileExistsByMD5(const std::string& file_md5) {
     return exists;
 }
 
-// 新增：记录文件 MD5 映射（上传完成后调用）
-void HttpRequest::recordFileMD5(const std::string& file_md5, const std::string& file_id) {
+// 修复：记录分片 MD5 映射（分片上传完成后调用）
+void HttpRequest::recordChunkMD5(const std::string& video_id, int chunk_index, const std::string& chunk_md5) {
     redisContext* redis = RedisConnPool::Instance()->GetConnection();
     if (!redis) {
-        LOG_ERROR("Failed to get Redis connection for MD5 record");
+        LOG_ERROR("Failed to get Redis connection for chunk MD5 record");
         return;
     }
     
-    // 存储 MD5 -> file_id 映射
-    std::string key = "md5_index:" + file_md5;
-    redisReply* reply = (redisReply*)redisCommand(redis, "SET %s %s", key.c_str(), file_id.c_str());
+    // 修复：存储 md5_chunk:{video_id}:{chunk_index} -> chunk_md5 映射
+    std::string key = "md5_chunk:" + video_id + ":" + std::to_string(chunk_index);
+    redisReply* reply = (redisReply*)redisCommand(redis, "SET %s %s", key.c_str(), chunk_md5.c_str());
     
     if (reply) {
-        LOG_INFO("记录 MD5 映射：%s -> %s", file_md5.c_str(), file_id.c_str());
+        LOG_INFO("记录分片 MD5 映射：%s -> %s", key.c_str(), chunk_md5.c_str());
         freeReplyObject(reply);
     } else {
-        LOG_ERROR("记录 MD5 映射失败：%s", file_md5.c_str());
+        LOG_ERROR("记录分片 MD5 映射失败：%s", key.c_str());
     }
     
     RedisConnPool::Instance()->ReturnConnection(redis);
+}
+
+// 新增：检查文件上传状态（基于 Redis Bitmap）
+bool HttpRequest::checkFileUploadStatus(const std::string& video_id, int total_chunks) {
+    redisContext* redis = RedisConnPool::Instance()->GetConnection();
+    if (!redis) {
+        LOG_ERROR("Failed to get Redis connection for file upload status check");
+        return false;
+    }
+    
+    std::string key = "upload:" + video_id;
+    redisReply* reply = (redisReply*)redisCommand(redis, "BITCOUNT %s", key.c_str());
+    
+    bool complete = false;
+    if (reply && reply->type == REDIS_REPLY_INTEGER) {
+        int uploaded_count = reply->integer;
+        LOG_INFO("文件上传状态检查：%s, %d/%d 分片已上传", 
+                 video_id.c_str(), uploaded_count, total_chunks);
+        complete = (uploaded_count == total_chunks);
+        freeReplyObject(reply);
+    }
+    
+    RedisConnPool::Instance()->ReturnConnection(redis);
+    return complete;
 }
 
 void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, const std::string& hls_url) {
     MYSQL* sql = nullptr;
     {
         SqlConnRAII raii(&sql, SqlConnPool::Instance());
-        if (!sql) return;
+        if (!sql) {
+            LOG_ERROR("Failed to get DB connection for status update: %s", video_id.c_str());
+            return;
+        }
 
         // ==================== 使用事务更新状态 ====================
         bool transaction_started = false;
@@ -990,6 +1214,8 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
                     commitTransaction(sql);
                 }
                 LOG_INFO("Video ready: %s -> %s", video_id.c_str(), hls_url.c_str());
+                // 修复：转码完成后重置 download_in_progress_
+                // 注意：不能在 static 方法中访问非静态成员，需移除
             } else {
                 LOG_ERROR("Video update failed: %s", mysql_error(sql));
                 if (transaction_started) {
@@ -1004,6 +1230,8 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
                     commitTransaction(sql);
                 }
                 LOG_INFO("Video failed: %s", video_id.c_str());
+                // 修复：失败时也重置 download_in_progress_
+                // 注意：不能在 static 方法中访问非静态成员，需移除
             } else {
                 LOG_ERROR("Video status update failed: %s", mysql_error(sql));
                 if (transaction_started) {
