@@ -76,6 +76,8 @@ private:
     void clearRedisRecord(const std::string& file_id);
     static void updateVideoStatus(const std::string& video_id, bool success, const std::string& hls_url);
     
+    // 修复：移除分布式锁，改用本地内存锁（单机部署足够）
+    
     // 修复：秒传相关方法改为分片级别
     bool checkChunkExistsByMD5(const std::string& video_id, int chunk_index, const std::string& chunk_md5);
     void recordChunkMD5(const std::string& video_id, int chunk_index, const std::string& chunk_md5);
@@ -122,6 +124,10 @@ private:
     
     // 修复：添加 upload_id 字段，用于 complete 请求时关联分片
     std::string upload_id_;
+    
+    // 新增：本地内存锁（保护文件合并操作，单机部署足够）
+    static std::mutex upload_mutex_;
+    static std::unordered_set<std::string> uploading_files_;
 
 };
 

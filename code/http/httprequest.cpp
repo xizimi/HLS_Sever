@@ -514,6 +514,33 @@ bool HttpRequest::my_parse(Buffer& buff) {
             return false;
         }
         
+        // ==================== 新增：获取本地内存锁（防止并发合并）====================
+        // 修复：单机部署不需要分布式锁，使用本地 mutex 即可
+        {
+            std::lock_guard<std::mutex> lock(upload_mutex_);
+            
+            // 检查是否已在上传中（防止重复处理）
+            if (uploading_files_.count(upload_id) > 0) {
+                LOG_WARN("[Local Lock] Upload already in progress for upload_id: %s", upload_id.c_str());
+                download_in_progress_ = false;
+                return true;  // 返回成功，避免客户端重试
+            }
+            uploading_files_.insert(upload_id);
+        }
+        
+        // 使用 RAII 确保锁一定释放
+        struct LockGuard {
+            std::string& id;
+            LockGuard(std::string& upload_id) : id(upload_id) {}
+            ~LockGuard() {
+                std::lock_guard<std::mutex> lock(upload_mutex_);
+                uploading_files_.erase(id);
+                LOG_INFO("[Local Lock] Released for upload_id: %s", id.c_str());
+            }
+        } lock_guard(upload_id);
+        
+        LOG_INFO("[Local Lock] Lock acquired for upload_id: %s", upload_id.c_str());
+        
         // 修复：使用 upload_id 作为 chunk_dir，与 openChunkFile 一致
         std::string chunk_dir = "./sever_videodata/" + upload_id;
         std::string output_path = "./sever_videodata/" + upload_id + "/merged_" + filename;
@@ -552,6 +579,22 @@ bool HttpRequest::my_parse(Buffer& buff) {
                         std::string escaped_name = escape(filename);
                         std::string escaped_hls = escape(hls_path);
                         std::string escaped_upload_id = escape(upload_id);
+                        
+                        // 修复：先检查 upload_id 是否已存在（防止重复插入）
+                        std::string check_sql = 
+                            "SELECT id FROM videos WHERE upload_id = '" + escaped_upload_id + "' LIMIT 1";
+                        if (mysql_query(sql, check_sql.c_str()) == 0) {
+                            MYSQL_RES* res = mysql_store_result(sql);
+                            if (res && mysql_num_rows(res) > 0) {
+                                // upload_id 已存在，说明之前已处理过
+                                LOG_WARN("[Transaction] upload_id already exists: %s", upload_id.c_str());
+                                mysql_free_result(res);
+                                rollbackTransaction(sql);
+                                download_in_progress_ = false;
+                                return true;  // 返回成功，避免客户端重试
+                            }
+                            mysql_free_result(res);
+                        }
                         
                         // 修复：插入视频记录时同时保存 upload_id 关联
                         std::string insert_sql =
@@ -645,20 +688,28 @@ bool HttpRequest::my_parse(Buffer& buff) {
                 };
                 
                 std::string escaped_id = escape(video_id);
+                // 修复：使用条件更新实现乐观锁（只有 status='uploading' 才能更新）
                 std::string update_sql = 
-                    "UPDATE videos SET status = 'processing' WHERE id = '" + escaped_id + "'";
+                    "UPDATE videos SET status = 'processing' WHERE id = '" + escaped_id + "' AND status = 'uploading'";
                 
                 if (mysql_query(sql, update_sql.c_str()) == 0) {
-                    LOG_INFO("[Step 3 Success] Video status updated to 'processing': %s", video_id.c_str());
+                    // 检查是否有行被影响
+                    if (mysql_affected_rows(sql) > 0) {
+                        LOG_INFO("[Step 3 Success] Video status updated to 'processing': %s", video_id.c_str());
+                    } else {
+                        LOG_WARN("[Step 3 Warn] No rows affected, status may have changed: %s", video_id.c_str());
+                    }
                 } else {
                     LOG_ERROR("[Step 3 Failed] Status update failed: %s", mysql_error(sql));
-                }
+                } 
             }
         }
         
-        // ==================== 步骤 4: 启动 HLS 转码（转码完成后 UPDATE status='ready'） ====================
+        // ==================== 步骤 4: 启动 HLS 转码（转码完成后 UPDATE status='ready'）====================
         convertToHLSAsync(output_path, hls_path, video_id);
         download_in_progress_ = true;
+        
+        // 修复：本地锁由 RAII 自动释放
         
         LOG_INFO("[Step 4] HLS conversion started for: %s", video_id.c_str());
     }
@@ -1207,15 +1258,21 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
         std::string escaped_id = escape(video_id);
         if (success) {
             std::string escaped_url = escape(hls_url);
+            // 修复：使用条件更新实现乐观锁（只有 status='processing' 才能更新为 ready）
             std::string sql_str = 
-                "UPDATE videos SET hls_path = '" + escaped_url + "', status = 'ready' WHERE id = '" + escaped_id + "'";
+                "UPDATE videos SET hls_path = '" + escaped_url + "', status = 'ready' WHERE id = '" + escaped_id + "' AND status = 'processing'";
             if (mysql_query(sql, sql_str.c_str()) == 0) {
-                if (transaction_started) {
-                    commitTransaction(sql);
+                if (mysql_affected_rows(sql) > 0) {
+                    if (transaction_started) {
+                        commitTransaction(sql);
+                    }
+                    LOG_INFO("Video ready: %s -> %s", video_id.c_str(), hls_url.c_str());
+                } else {
+                    LOG_WARN("Video status update skipped, current status may not be 'processing': %s", video_id.c_str());
+                    if (transaction_started) {
+                        rollbackTransaction(sql);
+                    }
                 }
-                LOG_INFO("Video ready: %s -> %s", video_id.c_str(), hls_url.c_str());
-                // 修复：转码完成后重置 download_in_progress_
-                // 注意：不能在 static 方法中访问非静态成员，需移除
             } else {
                 LOG_ERROR("Video update failed: %s", mysql_error(sql));
                 if (transaction_started) {
@@ -1223,6 +1280,7 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
                 }
             }
         } else {
+            // 修复：失败状态更新不需要条件（任何状态都可以更新为 failed）
             std::string sql_str = 
                 "UPDATE videos SET status = 'failed' WHERE id = '" + escaped_id + "'";
             if (mysql_query(sql, sql_str.c_str()) == 0) {
@@ -1230,8 +1288,6 @@ void HttpRequest::updateVideoStatus(const std::string& video_id, bool success, c
                     commitTransaction(sql);
                 }
                 LOG_INFO("Video failed: %s", video_id.c_str());
-                // 修复：失败时也重置 download_in_progress_
-                // 注意：不能在 static 方法中访问非静态成员，需移除
             } else {
                 LOG_ERROR("Video status update failed: %s", mysql_error(sql));
                 if (transaction_started) {
